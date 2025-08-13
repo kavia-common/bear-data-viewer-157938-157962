@@ -38,10 +38,11 @@ class BearList(MethodView):
             list[dict]: A list of bear records suitable for JSON serialization.
         """
         now = datetime.now(timezone.utc)
+        # Return Python datetime objects; Marshmallow will serialize to ISO 8601 strings.
         data = [
-            {"bearId": "B001", "pose": "Sitting", "timestamp": (now - timedelta(seconds=5)).isoformat()},
-            {"bearId": "B002", "pose": "Standing", "timestamp": (now - timedelta(seconds=15)).isoformat()},
-            {"bearId": "B003", "pose": "Walking", "timestamp": (now - timedelta(seconds=25)).isoformat()},
+            {"bearId": "B001", "pose": "Sitting", "timestamp": (now - timedelta(seconds=5))},
+            {"bearId": "B002", "pose": "Standing", "timestamp": (now - timedelta(seconds=15))},
+            {"bearId": "B003", "pose": "Walking", "timestamp": (now - timedelta(seconds=25))},
         ]
         return data
 
