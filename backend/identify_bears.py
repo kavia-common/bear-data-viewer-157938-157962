@@ -18,6 +18,12 @@ Design principles:
 - Extensible structure with typed public interfaces and docstrings
 
 No real S3 or YOLO credentials are included; placeholders and comments indicate where to configure them.
+
+Update:
+- Adds database persistence using SQLAlchemy so detections are stored in the same
+  backend database used by the bears.py REST API. Since bears.py currently serves
+  mock data, this file provides a minimal model and connection logic that the API
+  can later reuse, or that can be aligned with an existing DB model if added.
 """
 
 import os
@@ -49,6 +55,23 @@ try:
 except Exception:  # pragma: no cover - optional dep
     cv2 = None  # type: ignore
 
+# Database (SQLAlchemy) - optional dependency; add to requirements if needed.
+try:
+    from sqlalchemy import (
+        create_engine,
+        Column,
+        Integer,
+        String,
+        Float,
+        DateTime,
+        JSON,
+    )
+    from sqlalchemy.orm import sessionmaker, declarative_base
+except Exception:  # pragma: no cover - optional dep
+    create_engine = None  # type: ignore
+    Column = Integer = String = Float = DateTime = JSON = None  # type: ignore
+    sessionmaker = declarative_base = None  # type: ignore
+
 
 # ------------------------------------------------------------------------------
 # Configuration
@@ -71,11 +94,21 @@ PROB_THRESHOLD = float(os.environ.get("PROBABILITY_THRESHOLD", "0.3"))
 # Hardcoded bear ID
 HARDCODED_BEAR_ID = "011"
 
+# Database config (use env variables; do NOT hard-code secrets)
+# Prefer a full SQLALCHEMY_DATABASE_URI if provided; otherwise fall back to SQLite file.
+SQLALCHEMY_DATABASE_URI = os.environ.get(
+    "SQLALCHEMY_DATABASE_URI",
+    # Local, file-based SQLite fallback for development
+    "sqlite:///bear_data.db",
+)
+
+# Connection pool sizing (tunable)
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "5"))
+DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "10"))
 
 # ------------------------------------------------------------------------------
 # Logging Setup
 # ------------------------------------------------------------------------------
-
 def _setup_logging() -> None:
     """
     Configure application logging with a standard formatter.
@@ -92,9 +125,100 @@ logger = logging.getLogger("identify_bears")
 
 
 # ------------------------------------------------------------------------------
+# DB Setup (SQLAlchemy)
+# ------------------------------------------------------------------------------
+Base = declarative_base() if callable(declarative_base) else None  # type: ignore
+
+
+def _db_engine():
+    """
+    Returns a SQLAlchemy engine configured via environment variables.
+
+    If SQLAlchemy is not installed, returns None so callers can degrade gracefully.
+    """
+    if create_engine is None:
+        logger.warning("SQLAlchemy not installed; results will be logged only.")
+        return None
+    try:
+        # For SQLite, pool options are mostly ignored; safe to include.
+        engine = create_engine(
+            SQLALCHEMY_DATABASE_URI,
+            pool_size=DB_POOL_SIZE,
+            max_overflow=DB_MAX_OVERFLOW,
+            future=True,
+        )
+        return engine
+    except Exception as e:
+        logger.exception("Failed to create DB engine: %s", e)
+        return None
+
+
+def _db_session_factory(engine):
+    """
+    Returns a configured SQLAlchemy session factory for the provided engine.
+    """
+    if sessionmaker is None:
+        return None
+    return sessionmaker(bind=engine, future=True)
+
+
+# Minimal detection table to persist YOLO detections.
+# This is designed as a general-purpose store. The REST API (bears.py) can later
+# read from this table or a view on top of it.
+if Base is not None:
+    class Detection(Base):  # type: ignore
+        """
+        Represents a single detection event from the bear identification pipeline.
+        """
+        __tablename__ = "detections"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        # Bear identifier (currently hardcoded '011' from pipeline)
+        bear_id = Column(String(64), nullable=False, index=True)
+        # Label predicted by the detector (e.g., 'bear')
+        label = Column(String(128), nullable=False, index=True)
+        # Detection probability/confidence
+        probability = Column(Float, nullable=False)
+        # Bounding box coordinates
+        x1 = Column(Float, nullable=False)
+        y1 = Column(Float, nullable=False)
+        x2 = Column(Float, nullable=False)
+        y2 = Column(Float, nullable=False)
+        # Event timestamp (UTC)
+        timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+        # Raw/extra payload for future extensibility
+        extra = Column(JSON, nullable=True)
+else:
+    Detection = None  # type: ignore
+
+
+def _ensure_schema(engine) -> None:
+    """
+    Create tables if they don't exist (idempotent). In production one would
+    use Alembic migrations. This is a simple bootstrap for demo/dev.
+    """
+    if Base is None:
+        return
+    try:
+        Base.metadata.create_all(engine)
+    except Exception as e:
+        logger.exception("Failed to create DB schema: %s", e)
+
+
+def _parse_iso8601(ts: str) -> datetime:
+    """
+    Parse ISO-8601 timestamp into a timezone-aware datetime.
+    """
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        # If somehow tz isn't included, force UTC to avoid DB constraint issues.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# ------------------------------------------------------------------------------
 # S3 Handling
 # ------------------------------------------------------------------------------
-
 def _get_s3_client() -> Optional[Any]:
     """
     Create and return a boto3 S3 client using environment variables or
@@ -184,7 +308,6 @@ def load_yolo_model(model_path: str) -> Any:
 # ------------------------------------------------------------------------------
 # Video Handling
 # ------------------------------------------------------------------------------
-
 def _open_video_capture(video_path: str) -> Optional[Any]:
     """
     Open a video file for frame-by-frame reading.
@@ -238,7 +361,6 @@ def _frame_generator(video_path: str) -> Generator[Tuple[Any, float], None, None
 # ------------------------------------------------------------------------------
 # Inference and Post-processing
 # ------------------------------------------------------------------------------
-
 def _predict(model: Any, frame: Any) -> Any:
     """
     Run model prediction on a single frame.
@@ -357,40 +479,109 @@ def filter_and_format_detections(raw_results: Any, threshold: float) -> List[Dic
 # ------------------------------------------------------------------------------
 # Results Handling
 # ------------------------------------------------------------------------------
+def _get_db_integration():
+    """
+    Returns a tuple (engine, Session, model) or (None, None, None) if DB is unavailable.
+    Ensures schema exists if DB is available.
+    """
+    engine = _db_engine()
+    if engine is None or sessionmaker is None or Detection is None:
+        return None, None, None
+    _ensure_schema(engine)
+    Session = _db_session_factory(engine)
+    return engine, Session, Detection
+
 
 # PUBLIC_INTERFACE
 def write_results(records: Iterable[Dict[str, Any]]) -> None:
     """
-    Handle persisting or emitting results. This is a stub designed for extension.
+    Persist detection results to the database if available; otherwise log them.
 
-    For now, it logs the detections. In a real deployment, you might:
-      - Publish to a message queue (Kafka, RabbitMQ)
-      - Insert into a database
-      - Write to a file or object store
-      - Emit metrics/events
+    The database model used is 'detections' with fields:
+    - bear_id, label, probability, x1, y1, x2, y2, timestamp, extra
 
     Args:
         records: Iterable of detection dicts returned by filter_and_format_detections.
     """
-    count = 0
-    for rec in records:
-        logger.info(
-            "Detection | bearID=%s label=%s prob=%.3f bbox=%s ts=%s",
-            rec.get("bearID"),
-            rec.get("label"),
-            float(rec.get("probability", 0)),
-            rec.get("bounding_box_coordinates"),
-            rec.get("timestamp"),
-        )
-        count += 1
-    if count == 0:
-        logger.debug("No detections above threshold in this frame.")
+    engine, Session, DetectionModel = _get_db_integration()
+    if engine is None or Session is None or DetectionModel is None:
+        # Fallback to logging if DB is not available.
+        count = 0
+        for rec in records:
+            logger.info(
+                "Detection | bearID=%s label=%s prob=%.3f bbox=%s ts=%s",
+                rec.get("bearID"),
+                rec.get("label"),
+                float(rec.get("probability", 0)),
+                rec.get("bounding_box_coordinates"),
+                rec.get("timestamp"),
+            )
+            count += 1
+        if count == 0:
+            logger.debug("No detections above threshold in this frame.")
+        return
+
+    # Persist to DB
+    sess = None
+    persisted = 0
+    try:
+        sess = Session()
+        for rec in records:
+            bbox = rec.get("bounding_box_coordinates") or (0.0, 0.0, 0.0, 0.0)
+            x1, y1, x2, y2 = (
+                float(bbox[0]) if len(bbox) > 0 else 0.0,
+                float(bbox[1]) if len(bbox) > 1 else 0.0,
+                float(bbox[2]) if len(bbox) > 2 else 0.0,
+                float(bbox[3]) if len(bbox) > 3 else 0.0,
+            )
+            ts = rec.get("timestamp") or _utc_iso_now()
+            try:
+                ts_dt = _parse_iso8601(ts)
+            except Exception:
+                ts_dt = datetime.now(timezone.utc)
+
+            det = DetectionModel(
+                bear_id=str(rec.get("bearID") or HARDCODED_BEAR_ID),
+                label=str(rec.get("label") or "unknown"),
+                probability=float(rec.get("probability") or 0.0),
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                timestamp=ts_dt,
+                # Store the raw record in extra for traceability/extensibility
+                extra={
+                    "source": "identify_bears.py",
+                    "raw": {
+                        k: v for k, v in rec.items() if k not in {"bearID", "label", "probability"}
+                    },
+                },
+            )
+            sess.add(det)
+            persisted += 1
+        if persisted > 0:
+            sess.commit()
+            logger.info("Persisted %d detection(s) to database.", persisted)
+        else:
+            logger.debug("No detections above threshold in this frame.")
+    except Exception as e:
+        if sess is not None:
+            try:
+                sess.rollback()
+            except Exception:
+                pass
+        logger.exception("Failed to persist detections: %s", e)
+    finally:
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------------------
 # Orchestration Loop
 # ------------------------------------------------------------------------------
-
 def _ensure_latest_video(tmp_dir: str, bucket: str, key: str) -> Optional[str]:
     """
     Download the latest video to a deterministic path under tmp_dir.
@@ -452,6 +643,7 @@ def run_loop(
         - This loop is designed to run indefinitely until interrupted.
         - All secrets/credentials should be provided via environment variables or
           external configuration. This script does not hardcode credentials.
+        - Database URL is taken from SQLALCHEMY_DATABASE_URI. Provide it via .env.
     """
     logger.info("Starting identify_bears loop. Bucket=%s Key=%s", s3_bucket, s3_key)
 
@@ -487,7 +679,6 @@ def run_loop(
 # ------------------------------------------------------------------------------
 # CLI Entrypoint
 # ------------------------------------------------------------------------------
-
 def main() -> None:
     """
     CLI entrypoint to start the continuous bear identification loop.
