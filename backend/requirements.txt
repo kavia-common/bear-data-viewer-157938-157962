@@ -18,4 +18,13 @@ pytest==8.3.5
 webargs==8.6.0
 Werkzeug==3.1.3
 flask-cors==5.0.1
-SQLAlchemy==2.0.36
+SQLAlchemy==2.0.37
+# Dependencies for identify_bear_movement.py
+boto3==1.35.84
+ultralytics==8.3.74
+opencv-python==4.10.0.84
+numpy==1.26.4
+# MySQL support (optional - can use SQLite by default)
+PyMySQL==1.1.1
+# Additional utilities
+python-dotenv==1.0.1
