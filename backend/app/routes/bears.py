@@ -1,7 +1,7 @@
 from flask_smorest import Blueprint
 from flask.views import MethodView
 from marshmallow import Schema, fields
-from datetime import datetime, timezone, timedelta
+from bear_data_service import get_bear_data_for_flask
 
 blp = Blueprint(
     "Bears",
@@ -37,14 +37,8 @@ class BearList(MethodView):
         Returns:
             list[dict]: A list of bear records suitable for JSON serialization.
         """
-        now = datetime.now(timezone.utc)
-        # Return Python datetime objects; Marshmallow will serialize to ISO 8601 strings.
-        data = [
-            {"bearId": "B001", "pose": "Sitting", "timestamp": (now - timedelta(seconds=5))},
-            {"bearId": "B002", "pose": "Standing", "timestamp": (now - timedelta(seconds=15))},
-            {"bearId": "B003", "pose": "Walking", "timestamp": (now - timedelta(seconds=25))},
-        ]
-        return data
+        # Use shared service module for business logic
+        return get_bear_data_for_flask()
 
     # Document response schema via flask-smorest
     get = blp.response(

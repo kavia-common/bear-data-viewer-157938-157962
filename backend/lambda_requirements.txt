@@ -1,0 +1,16 @@
+# Minimal dependencies for AWS Lambda deployment
+# Note: AWS Lambda runtime already includes many standard libraries
+
+# No Flask dependencies needed for Lambda
+# Removed: Flask, flask-smorest, flask-cors, Werkzeug, Jinja2, etc.
+
+# Keep only essential dependencies that might be needed
+marshmallow==3.26.1
+
+# Optional: If you plan to use the database functionality from identify_bears.py
+# Uncomment the following line if database integration is needed:
+# SQLAlchemy==2.0.36
+
+# Development and testing dependencies (not needed in Lambda runtime)
+# flake8==7.2.0
+# pytest==8.3.5
