@@ -387,6 +387,57 @@ def _utc_iso_now() -> str:
 
 
 # PUBLIC_INTERFACE
+def run_pipeline_over_video(video_path: str) -> List[Dict[str, Any]]:
+    """
+    Run the modular pipeline (pipeline/*) over a local video file and return emitted events.
+
+    This provides a minimal example of composing and executing the pipeline stepwise,
+    emitting events produced by EventDeterminationStage. It does not persist results;
+    callers may forward emitted events to write_results(records) if desired.
+
+    Args:
+        video_path: Local filesystem path to a video file.
+
+    Returns:
+        A list of emitted events (dicts).
+    """
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        logger.error("OpenCV (cv2) is required to use run_pipeline_over_video.")
+        return []
+
+    # Build pipeline with pass-through frames (we will feed frames below)
+    from pipeline.runner import build_default_pipeline, run_on_frames
+
+    pipeline, _ctx = build_default_pipeline(read_with_opencv=False)
+
+    def frame_gen():
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error("Failed to open video: %s", video_path)
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        idx = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                ts = (idx / fps) if fps and fps > 0 else 0.0
+                yield frame, idx, ts
+                idx += 1
+        finally:
+            cap.release()
+
+    events: List[Dict[str, Any]] = []
+    for item in run_on_frames(frame_gen(), pipeline):
+        # Normalize to match the existing write_results structure if needed later
+        events.append(item)
+    return events
+
+
+# PUBLIC_INTERFACE
 def filter_and_format_detections(raw_results: Any, threshold: float) -> List[Dict[str, Any]]:
     """
     Filter model detections by a probability threshold and format them into
