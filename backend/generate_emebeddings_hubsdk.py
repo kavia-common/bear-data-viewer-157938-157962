@@ -3,7 +3,7 @@
 generate_emebeddings_hubsdk.py
 
 A Python script that accepts a local image file path (via command line argument),
-loads the image using Ultralytics HUBSDK, generates embeddings, and prints them to stdout.
+loads the image using Ultralytics YOLO models, generates embeddings, and prints them to stdout.
 
 Usage:
     python generate_emebeddings_hubsdk.py <image_path>
@@ -12,7 +12,7 @@ Example:
     python generate_emebeddings_hubsdk.py /path/to/image.jpg
 
 Requirements:
-    - ultralytics-hub package must be installed
+    - ultralytics package must be installed
     - Valid Ultralytics HUB credentials may be required (set via environment variables)
     - Image file must exist and be in a supported format (jpg, png, etc.)
 
@@ -39,7 +39,7 @@ logger = logging.getLogger("generate_embeddings_hubsdk")
 
 # Optional dependency handling
 try:
-    from ultralytics import HUB
+    from ultralytics import hub
     HUB_AVAILABLE = True
 except ImportError as e:
     HUB_AVAILABLE = False
@@ -76,8 +76,8 @@ def check_dependencies() -> bool:
         bool: True if all required dependencies are available, False otherwise.
     """
     if not HUB_AVAILABLE:
-        logger.error("Ultralytics HUB is not installed. Please install it using:")
-        logger.error("pip install ultralytics[hub]")
+        logger.error("Ultralytics package is not installed. Please install it using:")
+        logger.error("pip install ultralytics")
         return False
     
     if not NUMPY_AVAILABLE:
@@ -141,7 +141,7 @@ def setup_hub_authentication() -> bool:
         try:
             # Attempt to authenticate with username/password
             # Note: This may vary based on the actual HUB SDK implementation
-            HUB.login(username=username, password=password)
+            hub.login(username=username, password=password)
             return True
         except Exception as e:
             logger.error("Failed to authenticate with username/password: %s", e)
@@ -210,7 +210,7 @@ def generate_embeddings_from_image(image_path: str) -> Optional[Any]:
         RuntimeError: If HUB SDK is not available or model loading fails.
     """
     if not HUB_AVAILABLE:
-        raise RuntimeError("Ultralytics HUB SDK is not available. Please install ultralytics[hub]")
+        raise RuntimeError("Ultralytics package is not available. Please install ultralytics")
     
     try:
         # Setup authentication
