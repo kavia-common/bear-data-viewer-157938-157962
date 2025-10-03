@@ -4,8 +4,8 @@ video_yolo_pipeline.py
 
 A simple, modular script that:
 1. Loads an MP4 video from the same directory as this script.
-2. Extracts the first frame.
-3. Uses YOLOv8m (detection) to find objects in the frame.
+2. Iterates through every frame of the video.
+3. Uses YOLOv8m (detection) to find objects in each frame.
 4. Filters detections labeled as 'bear', 'dog', or 'giraffe'.
 5. Crops these regions from the original frame.
 6. Runs YOLOv8-cls (classification) on each crop and prints the results.
@@ -21,12 +21,12 @@ Assumptions:
 Note:
 - The script automatically searches for the first .mp4 in the same directory if no specific
   filename is passed into run().
-- This is a simple demonstration; it processes only the first frame to keep compute light.
+- This version processes all frames in the video.
 """
 
 import os
 import sys
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Generator
 
 import numpy as np
 
@@ -209,8 +209,7 @@ def crop_detections(frame_bgr: np.ndarray, detections: List[Dict[str, Any]]) -> 
     h, w = frame_bgr.shape[:2]
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
-        xi1, yi1 = max(0, int(x1)), max(0, int(y1
-        ))
+        xi1, yi1 = max(0, int(x1)), max(0, int(y1))
         xi2, yi2 = min(w - 1, int(x2)), min(h - 1, int(y2))
         if xi2 <= xi1 or yi2 <= yi1:
             continue
@@ -319,12 +318,18 @@ def pose_on_crops(pose_model: Any, crops: List[Tuple[Dict[str, Any], np.ndarray]
     return results
 
 
-def _print_summary(
+def _print_summary_for_frame(
+    frame_idx: int,
     dets: List[Dict[str, Any]],
     cls_out: List[Dict[str, Any]],
     pose_out: List[Dict[str, Any]],
 ) -> None:
-    """Pretty-print a simple summary to stdout."""
+    """Pretty-print a per-frame summary to stdout."""
+    print(f"\n====== Frame {frame_idx} ======")
+    if not dets:
+        print("No target detections (bear/dog/giraffe).")
+        return
+
     print("=== Detection Summary (bear/dog/giraffe) ===")
     for i, d in enumerate(dets):
         bbox = d["bbox"]
@@ -341,6 +346,51 @@ def _print_summary(
         print(f"- {i+1}. det_label={det['label']} pose_keypoints_status={p['pose_keypoints_status']} num_keypoints={p['pose_num_keypoints']}")
 
 
+def _frame_reader(video_path: str) -> Generator[Tuple[int, np.ndarray], None, None]:
+    """Yield (frame_index, frame_bgr) for every frame in the video."""
+    cap = _load_video_capture(video_path)
+    idx = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            yield idx, frame
+            idx += 1
+    finally:
+        cap.release()
+
+
+def _process_single_frame(
+    frame_idx: int,
+    frame_bgr: np.ndarray,
+    detector: Any,
+    classifier: Any,
+    poser: Any,
+    labels: List[str],
+) -> None:
+    """Run the full pipeline for a single frame and print results."""
+    try:
+        det_results = run_detection(detector, frame_bgr)
+        dets = filter_detections(det_results, labels)
+    except Exception as e:
+        print(f"[ERROR] Detection failed on frame {frame_idx}: {e}", file=sys.stderr)
+        return
+
+    if not dets:
+        _print_summary_for_frame(frame_idx, [], [], [])
+        return
+
+    crops = crop_detections(frame_bgr, dets)
+    if not crops:
+        _print_summary_for_frame(frame_idx, dets, [], [])
+        return
+
+    cls_results = classify_crops(classifier, crops)
+    pose_results = pose_on_crops(poser, crops)
+    _print_summary_for_frame(frame_idx, dets, cls_results, pose_results)
+
+
 # PUBLIC_INTERFACE
 def run(
     video_filename: Optional[str] = None,
@@ -350,7 +400,7 @@ def run(
     labels_to_keep: Optional[List[str]] = None,
 ) -> None:
     """
-    Orchestrates the pipeline for a single local MP4 and first frame processing.
+    Orchestrates the pipeline for a single local MP4 and processes all frames.
 
     Args:
         video_filename: Name of the MP4 file in the same directory. If None, auto-detects first .mp4.
@@ -375,12 +425,7 @@ def run(
 
     print(f"[INFO] Using video: {video_path}")
 
-    frame = extract_first_frame(video_path)
-    if frame is None:
-        print("[ERROR] Failed to extract the first frame.", file=sys.stderr)
-        return
-
-    # Load models
+    # Load models once for efficiency
     try:
         detector, classifier, poser = load_models(
             detect_weights=detection_weights,
@@ -391,32 +436,9 @@ def run(
         print(f"[ERROR] Failed to load YOLO models: {e}", file=sys.stderr)
         return
 
-    # Detection
-    try:
-        det_results = run_detection(detector, frame)
-        dets = filter_detections(det_results, labels)
-    except Exception as e:
-        print(f"[ERROR] Detection failed: {e}", file=sys.stderr)
-        return
-
-    if not dets:
-        print("[INFO] No target detections in the first frame.")
-        return
-
-    # Crops
-    crops = crop_detections(frame, dets)
-    if not crops:
-        print("[INFO] Could not compute any valid crops from detections.")
-        return
-
-    # Classification on crops
-    cls_results = classify_crops(classifier, crops)
-
-    # Pose on crops
-    pose_results = pose_on_crops(poser, crops)
-
-    # Print summary
-    _print_summary(dets, cls_results, pose_results)
+    # Iterate over every frame and process
+    for frame_idx, frame in _frame_reader(video_path):
+        _process_single_frame(frame_idx, frame, detector, classifier, poser, labels)
 
 
 if __name__ == "__main__":
