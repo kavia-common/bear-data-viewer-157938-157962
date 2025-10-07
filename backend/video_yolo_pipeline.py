@@ -3,7 +3,9 @@
 video_yolo_pipeline.py
 
 A simple, modular script that:
-1. Loads an MP4 video from the same directory as this script.
+1. Loads an MP4 video from either:
+   - an HTTP/HTTPS URL (e.g., from S3) or
+   - a local path (backwards compatible behavior).
 2. Iterates through every frame of the video.
 3. Uses YOLOv8m (detection) to find objects in each frame.
 4. Filters detections labeled as 'bear', 'dog', or 'giraffe'.
@@ -18,14 +20,22 @@ Assumptions:
   such as 'yolov8m-cls.pt' and 'yolov8m-pose.pt'. If these aren't present locally, ultralytics will
   attempt to fetch them as per its standard behavior.
 
-Note:
-- The script automatically searches for the first .mp4 in the same directory if no specific
-  filename is passed into run().
-- This version processes all frames in the video.
+Notes:
+- Default video source is an HTTP URL: https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/1.mp4
+- You can override the source using CLI or env:
+    CLI:  python video_yolo_pipeline.py --video_url https://.../file.mp4
+    ENV:  export VIDEO_SOURCE_URL=https://.../file.mp4
+  Precedence: CLI > ENV > default.
+- Local file paths still work: python video_yolo_pipeline.py --local_file bears.mp4
+- If HTTP streaming fails to open, ensure your OpenCV build has FFmpeg/GStreamer support.
+  Tip: Use opencv-python wheels which include FFmpeg, or install FFmpeg in your environment.
+
+This version processes all frames in the video.
 """
 
 import os
 import sys
+import argparse
 from typing import List, Tuple, Optional, Dict, Any, Generator
 
 import numpy as np
@@ -41,6 +51,9 @@ try:
 except Exception as e:
     YOLO = None
     print(f"[WARN] ultralytics import failed: {e}", file=sys.stderr)
+
+
+DEFAULT_HTTP_VIDEO = "https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/1.mp4"
 
 
 # -------------------------- Utility/Helper Functions --------------------------
@@ -62,13 +75,25 @@ def find_local_mp4(directory: str) -> Optional[str]:
     return None
 
 
-def _load_video_capture(path: str):
-    """Load a cv2.VideoCapture for the given file path."""
+def _load_video_capture(path_or_url: str):
+    """
+    Load a cv2.VideoCapture for the given local path or HTTP/HTTPS URL.
+
+    For HTTP/HTTPS:
+    - Requires OpenCV build with FFmpeg (recommended) or GStreamer.
+    - If your environment lacks these, VideoCapture may fail to open.
+
+    Raises a RuntimeError with a clear message if opening fails.
+    """
     if cv2 is None:
         raise RuntimeError("OpenCV (cv2) is required but not available.")
-    cap = cv2.VideoCapture(path)
+    cap = cv2.VideoCapture(path_or_url)
     if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {path}")
+        # Provide guidance for HTTP streams
+        hint = ""
+        if path_or_url.lower().startswith(("http://", "https://")):
+            hint = " Ensure your OpenCV build has FFmpeg/GStreamer support for HTTP streams."
+        raise RuntimeError(f"Failed to open video source: {path_or_url}.{hint}")
     return cap
 
 
@@ -346,9 +371,9 @@ def _print_summary_for_frame(
         print(f"- {i+1}. det_label={det['label']} pose_keypoints_status={p['pose_keypoints_status']} num_keypoints={p['pose_num_keypoints']}")
 
 
-def _frame_reader(video_path: str) -> Generator[Tuple[int, np.ndarray], None, None]:
-    """Yield (frame_index, frame_bgr) for every frame in the video."""
-    cap = _load_video_capture(video_path)
+def _frame_reader(video_source: str) -> Generator[Tuple[int, np.ndarray], None, None]:
+    """Yield (frame_index, frame_bgr) for every frame in the video from path or URL."""
+    cap = _load_video_capture(video_source)
     idx = 0
     try:
         while True:
@@ -398,32 +423,51 @@ def run(
     classification_weights: str = "yolov8m-cls.pt",
     pose_weights: str = "yolov8m-pose.pt",
     labels_to_keep: Optional[List[str]] = None,
+    video_url: Optional[str] = None,
 ) -> None:
     """
-    Orchestrates the pipeline for a single local MP4 and processes all frames.
+    Orchestrates the pipeline for a video source and processes all frames.
 
     Args:
-        video_filename: Name of the MP4 file in the same directory. If None, auto-detects first .mp4.
+        video_filename: Local MP4 file in the same directory. If None and no URL provided, auto-detects first .mp4.
         detection_weights: Path/name for YOLOv8 detection model.
         classification_weights: Path/name for YOLOv8 classification model.
         pose_weights: Path/name for YOLOv8 pose model.
         labels_to_keep: Labels to filter from detection. Defaults to ['bear','dog','giraffe'].
+        video_url: HTTP/HTTPS URL to stream the video from.
+
+    Source selection precedence:
+        1) video_url argument (CLI)
+        2) VIDEO_SOURCE_URL environment variable
+        3) DEFAULT_HTTP_VIDEO
+        4) Fallback to local auto-detected .mp4 (backwards-compatible)
     """
     labels = labels_to_keep or ["bear", "dog", "giraffe"]
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    if video_filename is None:
-        video_path = find_local_mp4(base_dir)
-        if video_path is None:
-            print("[ERROR] No .mp4 file found in this directory.", file=sys.stderr)
-            return
-    else:
-        video_path = os.path.join(base_dir, video_filename)
-        if not os.path.exists(video_path):
-            print(f"[ERROR] File not found: {video_path}", file=sys.stderr)
-            return
+    # Resolve source with precedence: CLI arg > env > default URL
+    env_url = os.getenv("VIDEO_SOURCE_URL")
+    source_url = video_url or env_url or DEFAULT_HTTP_VIDEO
 
-    print(f"[INFO] Using video: {video_path}")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    video_source: Optional[str] = None
+
+    if source_url:
+        video_source = source_url
+        print(f"[INFO] Using video source (URL): {video_source}")
+    else:
+        # Backwards compatible path selection
+        if video_filename is None:
+            video_path = find_local_mp4(base_dir)
+            if video_path is None:
+                print("[ERROR] No .mp4 file found in this directory.", file=sys.stderr)
+                return
+        else:
+            video_path = os.path.join(base_dir, video_filename)
+            if not os.path.exists(video_path):
+                print(f"[ERROR] File not found: {video_path}", file=sys.stderr)
+                return
+        video_source = video_path
+        print(f"[INFO] Using video source (local file): {video_source}")
 
     # Load models once for efficiency
     try:
@@ -437,10 +481,48 @@ def run(
         return
 
     # Iterate over every frame and process
-    for frame_idx, frame in _frame_reader(video_path):
-        _process_single_frame(frame_idx, frame, detector, classifier, poser, labels)
+    try:
+        for frame_idx, frame in _frame_reader(video_source):
+            _process_single_frame(frame_idx, frame, detector, classifier, poser, labels)
+    except RuntimeError as e:
+        print(f"[ERROR] Could not open video source: {e}", file=sys.stderr)
+        print("[HINT] For HTTP URLs, ensure your OpenCV has FFmpeg/GStreamer support.", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("[INFO] Interrupted by user. Exiting...", file=sys.stderr)
+
+
+def _parse_args() -> argparse.Namespace:
+    """
+    Parse CLI arguments.
+
+    Examples:
+      - Stream from HTTP URL (recommended default):
+        python video_yolo_pipeline.py --video_url https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/1.mp4
+
+      - Use ENV:
+        export VIDEO_SOURCE_URL=https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/1.mp4
+        python video_yolo_pipeline.py
+
+      - Local file (backwards compatible):
+        python video_yolo_pipeline.py --local_file bears.mp4
+    """
+    parser = argparse.ArgumentParser(description="YOLO video pipeline with HTTP URL or local file input.")
+    parser.add_argument("--video_url", type=str, default=None, help="HTTP/HTTPS URL of the MP4 to stream.")
+    parser.add_argument("--local_file", type=str, default=None, help="Local MP4 filename in the same directory as this script.")
+    parser.add_argument("--detect", type=str, default="yolov8m.pt", help="Detection model weights path/name.")
+    parser.add_argument("--cls", type=str, default="yolov8m-cls.pt", help="Classification model weights path/name.")
+    parser.add_argument("--pose", type=str, default="yolov8m-pose.pt", help="Pose model weights path/name.")
+    parser.add_argument("--labels", type=str, nargs="*", default=None, help="Labels to keep from detection.")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # Run with defaults: auto-pick first .mp4 in this script's directory.
-    run()
+    args = _parse_args()
+    run(
+        video_filename=args.local_file,
+        detection_weights=args.detect,
+        classification_weights=args.cls,
+        pose_weights=args.pose,
+        labels_to_keep=args.labels,
+        video_url=args.video_url,
+    )
