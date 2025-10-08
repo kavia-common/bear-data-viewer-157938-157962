@@ -15,16 +15,35 @@ allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
 if allowed_origins_env:
     allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
 else:
-    # Restrict to the deployed frontend preview origins (ports 3000 and 4000)
+    # Include local development origins and deployed preview origins.
     allowed_origins = [
+        # Local development
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        # In some dev setups, backend may be hit directly from a tool on same host/port
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+        # Cloud preview URLs (retain existing)
         "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:3000",
         "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:4000",
     ]
 
-# Apply CORS only to API routes.
+# Apply CORS only to API routes and explicitly allow common headers/methods.
+# flask-cors will automatically handle OPTIONS preflight responses.
 CORS(
     app,
-    resources={r"/api/*": {"origins": allowed_origins}},
+    resources={
+        r"/api/*": {
+            "origins": allowed_origins,
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "expose_headers": ["Content-Type"],
+            "supports_credentials": False,
+            "max_age": 600,
+        }
+    },
 )
 
 # OpenAPI/Swagger configuration
