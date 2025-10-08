@@ -2,6 +2,7 @@ from flask_smorest import Blueprint
 from flask.views import MethodView
 from marshmallow import Schema, fields
 from datetime import datetime, timezone, timedelta
+from flask import make_response
 
 blp = Blueprint(
     "Bears",
@@ -52,3 +53,14 @@ class BearList(MethodView):
         BearSchema(many=True),
         description="List of mock Bear data",
     )(get)
+
+    # PUBLIC_INTERFACE
+    def options(self):
+        """
+        Preflight CORS handler for /api/bears.
+        The global CORS configuration via flask-cors should already handle this;
+        this explicit method ensures a 200/204 response with appropriate headers
+        even if a proxy or middleware bypasses the extension's automatic handling.
+        """
+        # Return empty body; headers will be set by flask-cors or after_request hook.
+        return make_response(("", 204))

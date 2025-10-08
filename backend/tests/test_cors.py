@@ -2,6 +2,7 @@ from flask import Response
 
 ORIGIN_LOCAL = "http://localhost:3000"
 ORIGIN_CLOUD = "https://vscode-internal-15672-beta.beta01.cloud.kavia.ai:4000"
+ORIGIN_CURRENT_PREVIEW_3000 = "https://vscode-internal-34388-beta.beta01.cloud.kavia.ai:3000"
 
 
 def test_cors_headers_present_on_get_bears_localhost(client):
@@ -67,3 +68,12 @@ def test_preflight_options_returns_cors_headers_cloud_origin(client):
     assert "Authorization" in allow_headers
     allow_methods = resp.headers.get("Access-Control-Allow-Methods", "")
     assert "GET" in allow_methods
+
+
+def test_cors_headers_present_on_get_bears_current_preview(client):
+    """
+    Ensure Access-Control-Allow-Origin is returned for the currently running preview :3000 origin.
+    """
+    resp: Response = client.get("/api/bears", headers={"Origin": ORIGIN_CURRENT_PREVIEW_3000})
+    assert resp.status_code == 200
+    assert resp.headers.get("Access-Control-Allow-Origin") == ORIGIN_CURRENT_PREVIEW_3000

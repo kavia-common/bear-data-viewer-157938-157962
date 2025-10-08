@@ -1,4 +1,5 @@
 import os
+import logging
 from flask import Flask, request, make_response
 from flask_cors import CORS
 from .routes.health import blp as health_blp
@@ -16,13 +17,20 @@ except Exception:
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
+# Basic logging for startup diagnostics
+logger = logging.getLogger("cors-config")
+if not logger.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+
 # Configure CORS using environment variables with sensible defaults.
-# Backwards compatibility: also support legacy CORS_ALLOWED_ORIGINS.
+# Backwards compatibility: also support legacy CORS_ALLOWED_ORIGINS (note the 'ED').
+# Precedence: CORS_ALLOW_ORIGINS takes priority, then CORS_ALLOWED_ORIGINS, else defaults.
 allowed_origins_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS")
 if allowed_origins_env:
     allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
 else:
     # Defaults include localhost and example preview origins.
+    # Include current running container preview domain ports 3000 and 4000 as requested.
     allowed_origins = [
         # Local development frontend
         "http://localhost:3000",
@@ -36,11 +44,20 @@ else:
         "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:3000",
         "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:4000",
         "https://vscode-internal-15672-beta.beta01.cloud.kavia.ai:4000",
+        # Add current running workspace preview mentioned in the task
+        "https://vscode-internal-34388-beta.beta01.cloud.kavia.ai:3000",
+        "https://vscode-internal-34388-beta.beta01.cloud.kavia.ai:4000",
     ]
 
 supports_credentials = (os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() == "true")
 allow_headers = [h.strip() for h in os.getenv("CORS_ALLOW_HEADERS", "Content-Type,Authorization").split(",") if h.strip()]
 methods = [m.strip().upper() for m in os.getenv("CORS_ALLOW_METHODS", "GET,POST,PUT,PATCH,DELETE,OPTIONS").split(",") if m.strip()]
+
+# Log resolved CORS config at startup for debugging
+logger.info("CORS resolved origins: %s", allowed_origins)
+logger.info("CORS supports_credentials=%s", supports_credentials)
+logger.info("CORS allow_headers=%s", allow_headers)
+logger.info("CORS methods=%s", methods)
 
 # Apply CORS only to API routes and explicitly allow headers/methods.
 # flask-cors will automatically handle OPTIONS preflight responses.
@@ -56,6 +73,8 @@ CORS(
             "max_age": 600,
         }
     },
+    vary_header=True,  # ensure Vary: Origin behavior
+    automatic_options=True,  # ensure preflight handling
 )
 
 # Fallback after_request to ensure CORS headers are present for API routes
