@@ -5,19 +5,26 @@ from .routes.health import blp as health_blp
 from .routes.bears import blp as bears_blp
 from flask_smorest import Api
 
+# Load .env if present (non-fatal if python-dotenv not installed or file missing)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    # It's okay if python-dotenv isn't installed; environments like Docker/CI inject vars.
+    pass
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# Configure CORS to allow specified frontend origins.
-# CORS_ALLOWED_ORIGINS (comma-separated) can override defaults.
-allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
+# Configure CORS using environment variables with sensible defaults.
+# Backwards compatibility: also support legacy CORS_ALLOWED_ORIGINS.
+allowed_origins_env = os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS")
 if allowed_origins_env:
     allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
 else:
-    # Defaults include localhost and the requested cloud preview origin.
+    # Defaults include localhost and example preview origins.
     allowed_origins = [
-        # Local development
+        # Local development frontend
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         # Backend direct access during dev tools
@@ -25,24 +32,27 @@ else:
         "http://127.0.0.1:3001",
         "http://localhost:5000",
         "http://127.0.0.1:5000",
-        # Existing cloud preview origins (retain)
+        # Cloud preview origins (retained for current environment)
         "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:3000",
         "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:4000",
-        # Newly required frontend preview origin
         "https://vscode-internal-15672-beta.beta01.cloud.kavia.ai:4000",
     ]
 
-# Apply CORS only to API routes and explicitly allow common headers/methods.
+supports_credentials = (os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() == "true")
+allow_headers = [h.strip() for h in os.getenv("CORS_ALLOW_HEADERS", "Content-Type,Authorization").split(",") if h.strip()]
+methods = [m.strip().upper() for m in os.getenv("CORS_ALLOW_METHODS", "GET,POST,PUT,PATCH,DELETE,OPTIONS").split(",") if m.strip()]
+
+# Apply CORS only to API routes and explicitly allow headers/methods.
 # flask-cors will automatically handle OPTIONS preflight responses.
 CORS(
     app,
     resources={
         r"/api/*": {
             "origins": allowed_origins,
-            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization"],
+            "methods": methods,
+            "allow_headers": allow_headers,
             "expose_headers": ["Content-Type"],
-            "supports_credentials": False,
+            "supports_credentials": supports_credentials,
             "max_age": 600,
         }
     },
@@ -67,13 +77,12 @@ def ensure_cors_headers(resp):
                     resp.headers["Access-Control-Allow-Origin"] = origin
                     resp.headers.add("Vary", "Origin")
                     # Mirror core settings used above
-                    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-                    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                    resp.headers.setdefault("Access-Control-Allow-Methods", ", ".join(methods))
+                    resp.headers.setdefault("Access-Control-Allow-Headers", ", ".join(allow_headers))
                     resp.headers.setdefault("Access-Control-Expose-Headers", "Content-Type")
                     resp.headers.setdefault("Access-Control-Max-Age", "600")
-                    # We don't enable credentials unless required; keep consistent
-                    # If you need credentials, set supports_credentials True above and here:
-                    # resp.headers["Access-Control-Allow-Credentials"] = "true"
+                    if supports_credentials:
+                        resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
             # If origin not allowed, do not add CORS headers.
         return resp
     except Exception:
