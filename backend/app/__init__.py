@@ -1,5 +1,5 @@
 import os
-from flask import Flask
+from flask import Flask, request, make_response
 from flask_cors import CORS
 from .routes.health import blp as health_blp
 from .routes.bears import blp as bears_blp
@@ -46,9 +46,39 @@ CORS(
             "max_age": 600,
         }
     },
-    # Send CORS headers on all responses for matched resources (including GET)
-    # and appropriately handle preflight OPTIONS.
 )
+
+# Fallback after_request to ensure CORS headers are present for API routes
+# This addresses cases where middleware is bypassed or headers are stripped by a proxy.
+@app.after_request
+def ensure_cors_headers(resp):
+    """
+    Ensure CORS headers are present on /api/* responses for allowed origins.
+    This is a safe fallback in case a proxy strips headers or an early return bypasses CORS.
+    """
+    try:
+        origin = request.headers.get("Origin")
+        path = request.path or ""
+        # Only apply to API routes and when an Origin header is sent.
+        if origin and path.startswith("/api"):
+            if origin in allowed_origins:
+                # If flask-cors already set the header, leave it.
+                if not resp.headers.get("Access-Control-Allow-Origin"):
+                    resp.headers["Access-Control-Allow-Origin"] = origin
+                    resp.headers.add("Vary", "Origin")
+                    # Mirror core settings used above
+                    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+                    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                    resp.headers.setdefault("Access-Control-Expose-Headers", "Content-Type")
+                    resp.headers.setdefault("Access-Control-Max-Age", "600")
+                    # We don't enable credentials unless required; keep consistent
+                    # If you need credentials, set supports_credentials True above and here:
+                    # resp.headers["Access-Control-Allow-Credentials"] = "true"
+            # If origin not allowed, do not add CORS headers.
+        return resp
+    except Exception:
+        # In case of unexpected errors in the hook, return the response unmodified.
+        return resp
 
 # OpenAPI/Swagger configuration
 app.config["API_TITLE"] = "My Flask API"
