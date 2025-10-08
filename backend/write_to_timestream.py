@@ -277,10 +277,42 @@ def print_inserts_from_csv(csv_path: str) -> None:
 
     This function is a safe dry-run preview and does not perform any writes.
 
-    CSV headers are case-insensitive and should include:
-      bear_id, timestamp, activity, object_label, bounding_box, timeInSeconds
+    Expected CSV headers (case-insensitive):
+      frame_time_seconds,label,x1,y1,x2,y2,confidence
 
-    Skips rows missing required fields (bear_id, timestamp) with a warning.
+    Mapping to Timestream (WriteRecords):
+      - DatabaseName: metropark_bearsDB
+      - TableName: monitor_bears_tbl
+      - Records: list of records where for each CSV row:
+          Dimensions:
+            - { Name: "object_label", Value: <label> }
+            - Optional: { Name: "bbox", Value: "x1,y1,x2,y2" } as a compact attribute for the bbox
+          Measure:
+            Option A (preferred for clarity and compatibility with existing MULTI structure):
+              MeasureName: "activity_detection"
+              MeasureValueType: "MULTI"
+              MeasureValues:
+                - { Name: "confidence", Type: "DOUBLE", Value: <confidence> }
+                - { Name: "bbox_x1", Type: "DOUBLE", Value: <x1> }
+                - { Name: "bbox_y1", Type: "DOUBLE", Value: <y1> }
+                - { Name: "bbox_x2", Type: "DOUBLE", Value: <x2> }
+                - { Name: "bbox_y2", Type: "DOUBLE", Value: <y2> }
+              Time: str(int(frame_time_seconds))
+              TimeUnit: "SECONDS"
+            Option B (fallback if MULTI not desired by the caller):
+              MeasureName: "confidence"
+              MeasureValueType: "DOUBLE"
+              MeasureValue: <confidence>
+              Dimensions include an additional "bbox" dimension with csv-concatenated bbox
+
+    Robust parsing:
+      - Skip invalid rows with warnings.
+      - Missing/malformed numbers are handled gracefully; such rows are skipped.
+      - Time is set using frame_time_seconds (rounded down to integer seconds).
+
+    Notes:
+      - This function only prints the payload; it does NOT perform any AWS writes.
+      - Does not alter insert_bear_activity behavior.
     """
     if not os.path.exists(csv_path) or not os.path.isfile(csv_path):
         logger.error("CSV file not found: %s", csv_path)
@@ -300,26 +332,76 @@ def print_inserts_from_csv(csv_path: str) -> None:
             i = hidx.get(key, -1)
             return row[i].strip() if 0 <= i < len(row) and row[i] is not None else ""
 
+        # Helper: safe float parse
+        def _parse_float(val: str) -> Optional[float]:
+            try:
+                return float(val)
+            except Exception:
+                return None
+
         row_num = 1  # header read; start counting data rows from 2
         for row in reader:
             row_num += 1
-            bear_id = _get(row, "bear_id")
-            timestamp = _get(row, "timestamp")
-            activity = _get(row, "activity")
-            object_label = _get(row, "object_label")
-            bounding_box = _get(row, "bounding_box")
-            time_in_seconds = _get(row, "timeinseconds") or _get(row, "time_in_seconds")
+            # Extract expected fields with case-insensitive keys
+            ft = _get(row, "frame_time_seconds")
+            label = _get(row, "label")
+            x1s = _get(row, "x1")
+            y1s = _get(row, "y1")
+            x2s = _get(row, "x2")
+            y2s = _get(row, "y2")
+            confs = _get(row, "confidence")
 
-            if not bear_id or not timestamp:
-                logger.warning("Skipping row %d: missing required 'bear_id' or 'timestamp'", row_num)
+            # Validate required fields
+            if not ft or not label:
+                logger.warning("Skipping row %d: missing required 'frame_time_seconds' or 'label'", row_num)
                 continue
 
-            record = _build_record(bear_id, timestamp, activity, object_label, bounding_box, time_in_seconds)
+            # Parse numeric fields
+            ft_f = _parse_float(ft)
+            x1 = _parse_float(x1s)
+            y1 = _parse_float(y1s)
+            x2 = _parse_float(x2s)
+            y2 = _parse_float(y2s)
+            conf = _parse_float(confs)
+
+            # Ensure all needed numerics are valid
+            if ft_f is None or x1 is None or y1 is None or x2 is None or y2 is None or conf is None:
+                logger.warning(
+                    "Skipping row %d: malformed numeric values (ft=%r, x1=%r, y1=%r, x2=%r, y2=%r, conf=%r)",
+                    row_num, ft, x1s, y1s, x2s, y2s, confs
+                )
+                continue
+
+            # Build time in seconds (string int as required by Time when using SECONDS)
+            time_seconds_str = str(int(ft_f))
+
+            # Option A: MULTI measure with bbox components and confidence
+            record_multi = {
+                "Dimensions": [
+                    {"Name": "object_label", "Value": str(label)},
+                    # Include compact bbox as an additional attribute for convenience
+                    {"Name": "bbox", "Value": f"{x1s},{y1s},{x2s},{y2s}"},
+                ],
+                "MeasureName": "activity_detection",
+                "MeasureValueType": "MULTI",
+                "MeasureValues": [
+                    {"Name": "confidence", "Type": "DOUBLE", "Value": str(conf)},
+                    {"Name": "bbox_x1", "Type": "DOUBLE", "Value": str(x1)},
+                    {"Name": "bbox_y1", "Type": "DOUBLE", "Value": str(y1)},
+                    {"Name": "bbox_x2", "Type": "DOUBLE", "Value": str(x2)},
+                    {"Name": "bbox_y2", "Type": "DOUBLE", "Value": str(y2)},
+                ],
+                "Time": time_seconds_str,
+                "TimeUnit": "SECONDS",
+            }
+
             payload = {
                 "DatabaseName": DB_NAME,
                 "TableName": TABLE_NAME,
-                "Records": [record],
+                "Records": [record_multi],
             }
+
+            # Print the exact JSON payload for this row
             print(json.dumps(payload, indent=2))
 
 
