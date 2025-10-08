@@ -252,8 +252,19 @@ def _process():
                     except Exception:
                         conf = 0.0
 
+                    # Resolve class id and map to label via model names (if available)
                     cls_id = int(cls_list[i]) if i < len(cls_list) else -1
-                    label = names.get(cls_id, str(cls_id))
+                    label = names.get(cls_id, None)
+
+                    # Safeguard: if mapping unavailable or label not a string, skip
+                    if not isinstance(label, str):
+                        continue
+
+                    # Normalize label for case-insensitive comparison and whitespace trimming
+                    norm_label = label.strip().lower()
+                    if norm_label != "bear":
+                        # Only write rows labeled as 'bear'
+                        continue
 
                     if i < len(xyxy_list):
                         b = xyxy_list[i]
@@ -264,6 +275,7 @@ def _process():
                     else:
                         x1 = y1 = x2 = y2 = 0
 
+                    # Write the detection using the original label string (preserve case as produced by model)
                     _append_detection(out_path, t, label, x1, y1, x2, y2, conf)
                     total_detections_written += 1
 
