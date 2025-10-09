@@ -3,7 +3,7 @@
 video_yolo_pipeline_1.py
 
 Purpose:
-- Open a local video file "1.mp4" located in the same directory as this script.
+- Open a video from a hardcoded S3 HTTPS URL.
 - Sample one frame every 10 seconds across the video duration.
 - Run YOLOv8m object detection (ultralytics) over sampled frames.
 - Write detections to "identified_bear.dat" in CSV format with header:
@@ -25,6 +25,7 @@ Dependencies (already listed in backend/requirements.txt in this project):
 - opencv-python (cv2)
 - numpy (optional, not strictly needed here)
 - torch, torchvision (pulled as dependencies of ultralytics; used by the model)
+- requests (for URL fallback download; should be available, else add to requirements)
 
 Quick setup notes:
 - Ensure Python environment has dependencies installed (pip install -r backend/requirements.txt).
@@ -35,7 +36,7 @@ Quick setup notes:
 Exit Codes:
 - 0 on success (even if zero detections)
 - 1 on missing dependencies or unexpected runtime error
-- 2 if video file not found or cannot be opened
+- 2 if video URL not reachable or cannot be opened
 - 3 if model cannot be loaded
 
 Usage:
@@ -44,6 +45,8 @@ Usage:
 
 import sys
 import csv
+import tempfile
+import os
 from pathlib import Path
 from typing import List, Tuple
 
@@ -62,11 +65,20 @@ except Exception as e:
     print(f"[ERROR] ultralytics import failed: {e}", file=sys.stderr)
     ULTRALYTICS_AVAILABLE = False
 
+try:
+    import requests  # type: ignore
+    REQUESTS_AVAILABLE = True
+except Exception as e:
+    print(f"[WARN] requests import failed (URL fallback disabled): {e}", file=sys.stderr)
+    REQUESTS_AVAILABLE = False
+
 
 SAMPLE_INTERVAL_SECONDS = 10.0
 MODEL_WEIGHTS = "yolov8m.pt"
 OUTPUT_FILENAME = "identified_bear.dat"
-INPUT_VIDEO = "1.mp4"
+
+# Acceptance criteria: Use hardcoded S3 URL
+HARDCODED_VIDEO_URL = "https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/1.mp4"
 
 
 def _here() -> Path:
@@ -84,17 +96,72 @@ def _round4(x: float) -> float:
     return float(f"{x:.4f}")
 
 
-def _open_video(video_path: Path):
-    """Open the video via cv2 with basic validation."""
+def _open_video_from_source(url: str):
+    """
+    Try to open the video directly via URL with cv2.VideoCapture.
+    If that fails, attempt to download to a secure temporary file and open from disk.
+    Returns a tuple (cap, temp_path) where:
+      - cap is the opened cv2.VideoCapture or None
+      - temp_path is a Path to a temp file that should be deleted by the caller (or None)
+    """
     if not CV2_AVAILABLE:
         print("[ERROR] OpenCV (cv2) is required but not available.", file=sys.stderr)
-        return None
+        return None, None
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        print(f"[ERROR] Failed to open video: {video_path}", file=sys.stderr)
-        return None
-    return cap
+    # First attempt: direct URL open
+    print(f"[INFO] Attempting to open video via URL: {url}")
+    cap = cv2.VideoCapture(url)
+    if cap is not None and cap.isOpened():
+        return cap, None
+
+    # Fallback: download to temp file and open
+    print("[WARN] Direct URL open failed. Falling back to streaming download...")
+    if not REQUESTS_AVAILABLE:
+        print("[ERROR] requests library is not available; cannot download the video.", file=sys.stderr)
+        return None, None
+
+    temp_file = None
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            fd, temp_path = tempfile.mkstemp(prefix="video_url_", suffix=".mp4")
+            os.close(fd)  # Close file descriptor; we'll write using open()
+            temp_file = Path(temp_path)
+            print(f"[INFO] Downloading video to temporary file: {temp_file}")
+            with open(temp_file, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:  # filter out keep-alive chunks
+                        f.write(chunk)
+        # Try opening the downloaded file
+        cap = cv2.VideoCapture(str(temp_file))
+        if cap is not None and cap.isOpened():
+            print("[INFO] Opened video from downloaded temp file.")
+            return cap, temp_file
+        else:
+            print("[ERROR] Failed to open video from downloaded file.", file=sys.stderr)
+            # Cleanup if open failed
+            try:
+                if temp_file and temp_file.exists():
+                    temp_file.unlink()
+            except Exception:
+                pass
+            return None, None
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Failed to fetch video from URL: {e}", file=sys.stderr)
+        if temp_file and temp_file.exists():
+            try:
+                temp_file.unlink()
+            except Exception:
+                pass
+        return None, None
+    except Exception as e:
+        print(f"[ERROR] Unexpected error during URL fallback: {e}", file=sys.stderr)
+        if temp_file and temp_file.exists():
+            try:
+                temp_file.unlink()
+            except Exception:
+                pass
+        return None, None
 
 
 def _get_video_meta(cap) -> Tuple[float, float]:
@@ -175,27 +242,27 @@ def _append_detection(out_path: Path, time_s: float, label: str, x1: int, y1: in
 def _process():
     """Main processing routine with summary printing and exit codes."""
     base_dir = _here()
-    video_path = base_dir / INPUT_VIDEO
     out_path = base_dir / OUTPUT_FILENAME
-
-    # Validate video path
-    if not video_path.exists() or not video_path.is_file():
-        print(f"[ERROR] Video file not found: {video_path}", file=sys.stderr)
-        return 2, 0, 0, out_path
 
     # Load model
     model = _load_model()
     if model is None:
         return 3, 0, 0, out_path
 
-    # Open video
-    cap = _open_video(video_path)
+    # Open video from URL (with fallback)
+    cap, temp_path = _open_video_from_source(HARDCODED_VIDEO_URL)
     if cap is None:
+        print(f"[ERROR] Could not open video from URL: {HARDCODED_VIDEO_URL}", file=sys.stderr)
         return 2, 0, 0, out_path
 
     # Get metadata and compute samples
     fps, duration_sec = _get_video_meta(cap)
-    sample_times = _compute_sample_times(duration_sec, SAMPLE_INTERVAL_SECONDS)
+    if duration_sec <= 0:
+        # If duration unavailable, we still attempt at least at t=0
+        print("[WARN] Could not determine video duration. Sampling only the first frame.", file=sys.stderr)
+        sample_times = [0.0]
+    else:
+        sample_times = _compute_sample_times(duration_sec, SAMPLE_INTERVAL_SECONDS)
 
     total_frames_sampled = 0
     total_detections_written = 0
@@ -284,7 +351,18 @@ def _process():
                 continue
 
     finally:
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
+        # Cleanup temp file if we used fallback
+        if temp_path and isinstance(temp_path, Path):
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+                    print(f"[INFO] Cleaned up temporary file: {temp_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to remove temp file {temp_path}: {e}", file=sys.stderr)
 
     print(f"[INFO] total_frames_sampled={total_frames_sampled}")
     print(f"[INFO] total_detections_written={total_detections_written}")
