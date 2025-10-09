@@ -4,8 +4,9 @@ detect_bear_motion.py
 
 CSV-driven detection loader and simple grouping/filter utility for YOLO detections.
 
-This script reads a CSV file with headers exactly:
-  time_frame_in_secs,label,x1,y1,x2,y2,confidence
+This script reads a CSV file with headers:
+  Preferred: frame_time_seconds,label,x1,y1,x2,y2,confidence
+  Backward-compatible: time_frame_in_secs,label,x1,y1,x2,y2,confidence (a warning will be printed)
 
 It provides CLI controls to:
   - Filter by minimum confidence
@@ -24,15 +25,19 @@ Example usage:
   python detect_bear_motion.py --csv dets.csv --min-confidence 0.5 --labels bear,dog
   python detect_bear_motion.py --csv dets.csv --grouping flat --output out.json
   python detect_bear_motion.py --csv dets.csv --grouping frame --output out.json --quiet
+  python detect_bear_motion.py --csv dets.csv --move-threshold 10.0 --match-method centroid
+  python detect_bear_motion.py --csv dets.csv --match-method iou --iou-threshold 0.4
+  python detect_bear_motion.py --csv dets.csv --no-movement  # disables movement computation
 
 Acceptance/behavior:
-- Validates the CSV headers exactly as specified.
+- Validates CSV headers: prefers frame_time_seconds; accepts legacy time_frame_in_secs with a warning.
 - Parses rows with robust type conversion; skips malformed rows with warnings (unless --quiet).
 - Filters by --min-confidence and --labels (case-sensitive by default; see implementation).
 - grouping == 'frame' -> detections: { "0.0": [ {...}, ... ], "10.0": [ ... ] }
 - grouping == 'flat'  -> detections: [ {...}, {...}, ... ] where each dict has time_frame_in_secs
-- JSON schema: {"schema":"bear_motion_v1", "grouping":"frame|flat", "detections": <object|array>}
-- Prints concise summary with totals and min/max timestamps.
+- JSON schema: {"schema":"bear_motion_v1", "grouping":"frame|flat", "detections": <object|array>, "movements": [ ... ]}
+- When movement is enabled (default), associates detections between consecutive frames using centroid or IoU.
+- For matched pairs with centroid displacement > --move-threshold, emits BEAR_MOVED lines unless --quiet.
 
 """
 
@@ -46,8 +51,9 @@ import sys
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 
+# Updated required headers to new preferred name while maintaining backward compatibility in validation logic
 REQUIRED_HEADERS = [
-    "time_frame_in_secs",
+    "frame_time_seconds",
     "label",
     "x1",
     "y1",
@@ -97,14 +103,27 @@ def _parse_label(val: Any) -> Optional[str]:
 
 def _validate_headers(headers: List[str]) -> bool:
     """
-    Validate that headers exactly match REQUIRED_HEADERS in order.
+    Validate CSV headers. Accept both:
+      - New preferred: frame_time_seconds,label,x1,y1,x2,y2,confidence
+      - Legacy (backward-compatible): time_frame_in_secs,label,x1,y1,x2,y2,confidence
 
     Returns:
         bool: True if valid, False otherwise.
     """
     if headers is None:
         return False
-    return headers == REQUIRED_HEADERS
+    if headers == REQUIRED_HEADERS:
+        return True
+    legacy = [
+        "time_frame_in_secs",
+        "label",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "confidence",
+    ]
+    return headers == legacy
 
 
 def _normalize_label_list(labels_arg: Optional[str]) -> Optional[List[str]]:
@@ -122,7 +141,9 @@ def _row_to_detection(
     """
     Convert a CSV DictReader row into a normalized detection dict.
 
-    Expected keys: time_frame_in_secs,label,x1,y1,x2,y2,confidence
+    Expected keys:
+      - Preferred: frame_time_seconds,label,x1,y1,x2,y2,confidence
+      - Legacy accepted with warning: time_frame_in_secs,label,x1,y1,x2,y2,confidence
 
     Returns:
         dict with keys:
@@ -132,10 +153,18 @@ def _row_to_detection(
             - confidence (float)
         or None if malformed.
     """
-    # Parse time
-    t = _parse_float(row.get("time_frame_in_secs"))
+    # Parse time from preferred or legacy field
+    t_val = row.get("frame_time_seconds")
+    legacy_val = row.get("time_frame_in_secs")
+    if t_val is None and legacy_val is not None:
+        # Legacy key present; warn once per process (we'll set a module flag)
+        if not globals().get("_LEGACY_HEADER_WARNED", False):
+            _warn("Detected legacy CSV header 'time_frame_in_secs'. Please migrate to 'frame_time_seconds'.", quiet)
+            globals()["_LEGACY_HEADER_WARNED"] = True
+        t_val = legacy_val
+    t = _parse_float(t_val)
     if t is None:
-        _warn(f"Skipping row due to invalid time_frame_in_secs: {row.get('time_frame_in_secs')!r}", quiet)
+        _warn(f"Skipping row due to invalid frame time value: {t_val!r}", quiet)
         return None
 
     # Parse label
@@ -222,9 +251,13 @@ def load_csv(
             raise ValueError(f"CSV file is empty: {csv_path}")
 
         if not _validate_headers(reader.fieldnames):
+            expected = ",".join(REQUIRED_HEADERS)
+            legacy = "time_frame_in_secs,label,x1,y1,x2,y2,confidence"
             raise ValueError(
-                "Invalid CSV headers. Expected exactly:\n"
-                f"{','.join(REQUIRED_HEADERS)}\n"
+                "Invalid CSV headers. Expected either (preferred):\n"
+                f"{expected}\n"
+                "or legacy:\n"
+                f"{legacy}\n"
                 f"Got: {','.join(reader.fieldnames)}"
             )
 
@@ -335,7 +368,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 CSV requirements:
-  Headers exactly: time_frame_in_secs,label,x1,y1,x2,y2,confidence
+  Preferred headers: frame_time_seconds,label,x1,y1,x2,y2,confidence
+  Legacy accepted with warning: time_frame_in_secs,label,x1,y1,x2,y2,confidence
 
 Examples:
   python detect_bear_motion.py --csv dets.csv
@@ -405,6 +439,19 @@ Examples:
         default=0.3,
         help="IoU threshold used when --match-method iou is selected (default: 0.3).",
     )
+    parser.add_argument(
+        "--movement",
+        action="store_true",
+        default=True,
+        help="Enable movement computation across consecutive frames (default: enabled). Use --no-movement to disable.",
+    )
+    # Provide a --no-movement to disable (argparse boolean pair)
+    parser.add_argument(
+        "--no-movement",
+        dest="movement",
+        action="store_false",
+        help="Disable movement computation.",
+    )
     return parser
 
 
@@ -439,6 +486,7 @@ def _write_json(
     grouping: str,
     grouped_or_flat: Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]],
     quiet: bool,
+    movements: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     Write normalized JSON output to path.
@@ -447,7 +495,8 @@ def _write_json(
       {
         "schema": "bear_motion_v1",
         "grouping": "frame" | "flat",
-        "detections": {... or [...]}
+        "detections": {... or [...]},
+        "movements": [ ... ]   # optional, when movement detection enabled
       }
     """
     payload = {
@@ -455,6 +504,8 @@ def _write_json(
         "grouping": grouping,
         "detections": grouped_or_flat,
     }
+    if movements is not None:
+        payload["movements"] = movements
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -464,6 +515,105 @@ def _write_json(
 
 
 # PUBLIC_INTERFACE
+def _centroid(bbox: Dict[str, Any]) -> Tuple[float, float]:
+    """Compute centroid (cx, cy) from bbox dict with x1,y1,x2,y2."""
+    try:
+        x1 = float(bbox.get("x1"))
+        y1 = float(bbox.get("y1"))
+        x2 = float(bbox.get("x2"))
+        y2 = float(bbox.get("y2"))
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    except Exception:
+        return (float("nan"), float("nan"))
+
+
+def _iou(b1: Dict[str, Any], b2: Dict[str, Any]) -> float:
+    """Compute IoU between two bboxes; returns 0.0 if invalid."""
+    try:
+        ax1, ay1, ax2, ay2 = float(b1["x1"]), float(b1["y1"]), float(b1["x2"]), float(b1["y2"])
+        bx1, by1, bx2, by2 = float(b2["x1"]), float(b2["y1"]), float(b2["x2"]), float(b2["y2"])
+    except Exception:
+        return 0.0
+
+    # Normalize boxes (min/max) to be robust to x2<x1 inputs
+    ax1, ax2 = min(ax1, ax2), max(ax1, ax2)
+    ay1, ay2 = min(ay1, ay2), max(ay1, ay2)
+    bx1, bx2 = min(bx1, bx2), max(bx1, bx2)
+    by1, by2 = min(by1, by2), max(by1, by2)
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
+    area_b = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
+    union = area_a + area_b - inter_area
+    if union <= 0.0:
+        return 0.0
+    return inter_area / union
+
+
+def _associate_pairs(
+    prev: List[Dict[str, Any]],
+    cur: List[Dict[str, Any]],
+    method: str = "centroid",
+    iou_threshold: float = 0.3,
+) -> List[Tuple[int, int]]:
+    """
+    Greedy association between prev and cur lists based on method.
+
+    Returns:
+        list of (prev_index, cur_index) pairs.
+    """
+    pairs: List[Tuple[int, int]] = []
+    used_prev: set = set()
+    used_cur: set = set()
+
+    if method == "iou":
+        # Build all candidate pairs with IoU >= threshold, sorted by IoU desc
+        candidates: List[Tuple[float, int, int]] = []
+        for i, a in enumerate(prev):
+            for j, b in enumerate(cur):
+                iou = _iou(a.get("bbox", {}), b.get("bbox", {}))
+                if iou >= float(iou_threshold):
+                    candidates.append((iou, i, j))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, i, j in candidates:
+            if i in used_prev or j in used_cur:
+                continue
+            pairs.append((i, j))
+            used_prev.add(i)
+            used_cur.add(j)
+    else:
+        # Centroid-based: use nearest neighbor by Euclidean distance
+        import math
+        # Precompute centroids
+        prev_c = [_centroid(d.get("bbox", {})) for d in prev]
+        cur_c = [_centroid(d.get("bbox", {})) for d in cur]
+        candidates: List[Tuple[float, int, int]] = []
+        for i, (cx1, cy1) in enumerate(prev_c):
+            if any(map(lambda v: v != v, (cx1, cy1))):
+                continue
+            for j, (cx2, cy2) in enumerate(cur_c):
+                if any(map(lambda v: v != v, (cx2, cy2))):
+                    continue
+                dist = math.hypot(cx2 - cx1, cy2 - cy1)
+                candidates.append((dist, i, j))
+        candidates.sort(key=lambda x: x[0])
+        for _, i, j in candidates:
+            if i in used_prev or j in used_cur:
+                continue
+            pairs.append((i, j))
+            used_prev.add(i)
+            used_cur.add(j)
+    return pairs
+
+
 def iter_detections_per_frame(
     detections: Iterable[Dict[str, Any]]
 ) -> Iterator[Tuple[float, List[Dict[str, Any]]]]:
@@ -555,9 +705,69 @@ def main() -> None:
     else:
         grouped_or_flat = detections
 
+    # Movement computation across consecutive frames
+    movements: List[Dict[str, Any]] = []
+    if bool(args.movement):
+        # Build per-frame list sorted by timestamp
+        frames = list(iter_detections_per_frame(detections))
+        # Iterate adjacent frame pairs and associate detections
+        for idx in range(len(frames) - 1):
+            ts_prev, dets_prev = frames[idx]
+            ts_cur, dets_cur = frames[idx + 1]
+            # Respect label and confidence already filtered
+            pairs = _associate_pairs(
+                dets_prev, dets_cur, method=str(args.match_method), iou_threshold=float(args.iou_threshold)
+            )
+            # For each pair, compute centroid displacement
+            for pi, ci in pairs:
+                prev_det = dets_prev[pi]
+                cur_det = dets_cur[ci]
+                c1 = _centroid(prev_det.get("bbox", {}))
+                c2 = _centroid(cur_det.get("bbox", {}))
+                try:
+                    import math
+                    dx = float(c2[0]) - float(c1[0])
+                    dy = float(c2[1]) - float(c1[1])
+                    dist = math.hypot(dx, dy)
+                except Exception:
+                    continue
+
+                # Assign a simple track id by combining frame index and pair index when no prior mapping
+                track_id = f"t{idx}_{pi}->{ci}"
+                # Emit movement event if distance exceeds threshold
+                if dist > float(args.move_threshold):
+                    event = {
+                        "ts": float(ts_cur),
+                        "id": track_id,
+                        "dx": dx,
+                        "dy": dy,
+                        "dist": dist,
+                        "bbox": {
+                            "x1": cur_det.get("bbox", {}).get("x1"),
+                            "y1": cur_det.get("bbox", {}).get("y1"),
+                            "x2": cur_det.get("bbox", {}).get("x2"),
+                            "y2": cur_det.get("bbox", {}).get("y2"),
+                        },
+                        "conf": float(cur_det.get("confidence", 0.0)),
+                        "label": cur_det.get("label"),
+                    }
+                    movements.append(event)
+                    if not quiet:
+                        # Print exactly formatted BEAR_MOVED line
+                        x1 = event["bbox"]["x1"]
+                        y1 = event["bbox"]["y1"]
+                        x2 = event["bbox"]["x2"]
+                        y2 = event["bbox"]["y2"]
+                        conf = event["conf"]
+                        print(
+                            f"BEAR_MOVED ts={event['ts']:.6f} id={track_id} "
+                            f"dx={dx:.2f} dy={dy:.2f} dist={dist:.2f} "
+                            f"bbox=({x1},{y1},{x2},{y2}) conf={conf:.2f}"
+                        )
+
     # Write JSON if requested
     if args.output:
-        _write_json(args.output, args.grouping, grouped_or_flat, quiet)
+        _write_json(args.output, args.grouping, grouped_or_flat, quiet, movements=movements if bool(args.movement) else None)
 
     # Compute and print summary
     total_rows, frames_found, min_ts, max_ts = _summary(detections, quiet)
