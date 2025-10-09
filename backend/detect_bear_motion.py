@@ -2,74 +2,71 @@
 """
 detect_bear_motion.py
 
-A CLI utility to determine whether a bear has MOVED across frames based on
-centroid displacement relative to the bounding box size threshold per frame.
+CSV-driven detection loader and simple grouping/filter utility for YOLO detections.
 
-Inputs:
-- CSV file path via CLI.
-- CSV must contain at least a frame index and bounding box columns in one of the forms:
-  1) frame, cx, cy, w, h
-  2) frame, x, y, w, h
-  3) frame, x1, y1, x2, y2
+This script reads a CSV file with headers exactly:
+  time_frame_in_secs,label,x1,y1,x2,y2,confidence
 
-Computation steps:
-1. Parse rows, tolerating missing/invalid rows with warnings.
-2. For each valid row, compute the centroid:
-   - If cx,cy given: centroid = (cx, cy)
-   - Else if x,y given: centroid = (x + w/2, y + h/2)
-   - Else if corners (x1,y1,x2,y2) given: centroid = ((x1+x2)/2, (y1+y2)/2)
-3. For each frame in time order, compute displacement from previous valid centroid.
-4. For each frame, compute bounding box size metric for that frame:
-   - width,height from:
-       - (w,h) directly
-       - (x2-x1, y2-y1) for corners
-   - size metric chosen from:
-       - max: max(width, height)
-       - min: min(width, height)
-       - diag: sqrt(width^2 + height^2)
-5. A frame is considered "moved" if displacement > threshold_scale * size_metric.
-6. Finally print a summary to stdout:
-   - Total frames processed (valid ones used)
-   - Number of motion events (frames with moved=True; first frame has no displacement and is counted as False)
-   - MOVED: True/False  (True if any frame exceeded threshold)
+It provides CLI controls to:
+  - Filter by minimum confidence
+  - Filter by allowed labels
+  - Group detections by time_frame_in_secs or return a flat list
+  - Optionally write normalized JSON output to a file
+  - Print a concise summary of parsed and valid detections
 
-Optional:
-- --threshold-scale (float, default 1.0) to scale the size metric before comparison.
-- --size-metric (max|min|diag) choose bounding box size metric.
-- --per-frame to print a CSV of per-frame displacement and moved flag to stdout.
-  The per-frame CSV columns: frame, cx, cy, width, height, size_metric, displacement, moved
-- The script prints human-readable summary by default.
+Notes:
+- Only Python stdlib is used.
+- Video access is optional; the --video flag is accepted for future integration
+  (e.g., extracting frames), but this script does not implement heavy video processing.
 
-Dependencies:
-- Uses only the Python standard library.
+Example usage:
+  python detect_bear_motion.py --csv /path/to/dets.csv
+  python detect_bear_motion.py --csv dets.csv --min-confidence 0.5 --labels bear,dog
+  python detect_bear_motion.py --csv dets.csv --grouping flat --output out.json
+  python detect_bear_motion.py --csv dets.csv --grouping frame --output out.json --quiet
 
-Examples:
-  Basic usage:
-    python detect_bear_motion.py ./boxes.csv
+Acceptance/behavior:
+- Validates the CSV headers exactly as specified.
+- Parses rows with robust type conversion; skips malformed rows with warnings (unless --quiet).
+- Filters by --min-confidence and --labels (case-sensitive by default; see implementation).
+- grouping == 'frame' -> detections: { "0.0": [ {...}, ... ], "10.0": [ ... ] }
+- grouping == 'flat'  -> detections: [ {...}, {...}, ... ] where each dict has time_frame_in_secs
+- JSON schema: {"schema":"bear_motion_v1", "grouping":"frame|flat", "detections": <object|array>}
+- Prints concise summary with totals and min/max timestamps.
 
-  Use diagonal size metric and a 0.5 scale:
-    python detect_bear_motion.py ./boxes.csv --size-metric diag --threshold-scale 0.5
-
-  Output per-frame CSV:
-    python detect_bear_motion.py ./boxes.csv --per-frame
-
-  Combine:
-    python detect_bear_motion.py ./boxes.csv --size-metric max --threshold-scale 1.25 --per-frame
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import math
+import json
 import os
 import sys
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 
-def _warn(msg: str) -> None:
-    """Print a warning to stderr."""
-    print(f"[WARN] {msg}", file=sys.stderr)
+REQUIRED_HEADERS = [
+    "time_frame_in_secs",
+    "label",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "confidence",
+]
+
+
+def _print(msg: str, quiet: bool) -> None:
+    """Print info message unless quiet is True."""
+    if not quiet:
+        print(msg)
+
+
+def _warn(msg: str, quiet: bool) -> None:
+    """Print a warning to stderr unless quiet is True."""
+    if not quiet:
+        print(f"[WARN] {msg}", file=sys.stderr)
 
 
 def _err(msg: str) -> None:
@@ -77,12 +74,8 @@ def _err(msg: str) -> None:
     print(f"[ERROR] {msg}", file=sys.stderr)
 
 
-def _lower_strip(s: Optional[str]) -> str:
-    return (s or "").strip().lower()
-
-
 def _parse_float(val: Any) -> Optional[float]:
-    """Attempt to parse a value into float. Return None if invalid."""
+    """Try to parse a number to float; return None if invalid."""
     try:
         if val is None:
             return None
@@ -94,354 +87,469 @@ def _parse_float(val: Any) -> Optional[float]:
         return None
 
 
-def _detect_column_indices(headers: List[str]) -> Dict[str, int]:
-    """
-    Detect usable column indices from header row.
-    Supports any of the following sets:
-      - frame, cx, cy, w, h
-      - frame, x, y, w, h
-      - frame, x1, y1, x2, y2
-
-    Returns:
-        dict mapping of detected keys to indices.
-        Keys may include: frame,cx,cy,x,y,w,h,x1,y1,x2,y2
-        If detection fails, returns empty dict.
-    """
-    idx: Dict[str, int] = {}
-    if not headers:
-        return idx
-
-    hmap: Dict[str, int] = {}
-    for i, h in enumerate(headers):
-        key = _lower_strip(h)
-        if key:
-            hmap[key] = i
-
-    # minimal requirement: frame + some bbox form
-    if "frame" not in hmap:
-        return {}
-
-    # Prefer explicit centroid form first
-    if all(k in hmap for k in ("cx", "cy", "w", "h")):
-        idx["frame"] = hmap["frame"]
-        idx["cx"] = hmap["cx"]
-        idx["cy"] = hmap["cy"]
-        idx["w"] = hmap["w"]
-        idx["h"] = hmap["h"]
-        return idx
-
-    # Then try x,y,w,h
-    if all(k in hmap for k in ("x", "y", "w", "h")):
-        idx["frame"] = hmap["frame"]
-        idx["x"] = hmap["x"]
-        idx["y"] = hmap["y"]
-        idx["w"] = hmap["w"]
-        idx["h"] = hmap["h"]
-        return idx
-
-    # Then x1,y1,x2,y2
-    if all(k in hmap for k in ("x1", "y1", "x2", "y2")):
-        idx["frame"] = hmap["frame"]
-        idx["x1"] = hmap["x1"]
-        idx["y1"] = hmap["y1"]
-        idx["x2"] = hmap["x2"]
-        idx["y2"] = hmap["y2"]
-        return idx
-
-    return {}
-
-
-def _compute_centroid_and_size(row: List[str], idx: Dict[str, int]) -> Optional[Tuple[int, float, float, float, float]]:
-    """
-    Compute centroid (cx,cy) and (width,height) for a CSV row given detected indices.
-
-    Returns:
-        tuple: (frame_index, cx, cy, width, height)
-        or None if the row is invalid/unusable.
-    """
-    # Parse frame index
-    frame_val = row[idx["frame"]] if "frame" in idx and idx["frame"] < len(row) else None
-    frame_f = _parse_float(frame_val)
-    if frame_f is None:
-        _warn(f"Skipping row: invalid frame index value={frame_val!r}")
+def _parse_label(val: Any) -> Optional[str]:
+    """Parse label as non-empty string; return None if invalid."""
+    if val is None:
         return None
-    # keep as int if possible, else cast int of float
-    try:
-        frame_idx = int(frame_f)
-    except Exception:
-        frame_idx = int(round(frame_f))
-
-    # Case: cx,cy,w,h
-    if all(k in idx for k in ("cx", "cy", "w", "h")):
-        cx = _parse_float(row[idx["cx"]]) if idx["cx"] < len(row) else None
-        cy = _parse_float(row[idx["cy"]]) if idx["cy"] < len(row) else None
-        w = _parse_float(row[idx["w"]]) if idx["w"] < len(row) else None
-        h = _parse_float(row[idx["h"]]) if idx["h"] < len(row) else None
-        if None in (cx, cy, w, h):
-            _warn(f"Skipping row frame={frame_idx}: missing/invalid cx,cy,w,h")
-            return None
-        if w <= 0 or h <= 0:
-            _warn(f"Skipping row frame={frame_idx}: non-positive width/height (w={w}, h={h})")
-            return None
-        return (frame_idx, float(cx), float(cy), float(w), float(h))
-
-    # Case: x,y,w,h
-    if all(k in idx for k in ("x", "y", "w", "h")):
-        x = _parse_float(row[idx["x"]]) if idx["x"] < len(row) else None
-        y = _parse_float(row[idx["y"]]) if idx["y"] < len(row) else None
-        w = _parse_float(row[idx["w"]]) if idx["w"] < len(row) else None
-        h = _parse_float(row[idx["h"]]) if idx["h"] < len(row) else None
-        if None in (x, y, w, h):
-            _warn(f"Skipping row frame={frame_idx}: missing/invalid x,y,w,h")
-            return None
-        if w <= 0 or h <= 0:
-            _warn(f"Skipping row frame={frame_idx}: non-positive width/height (w={w}, h={h})")
-            return None
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-        return (frame_idx, float(cx), float(cy), float(w), float(h))
-
-    # Case: x1,y1,x2,y2
-    if all(k in idx for k in ("x1", "y1", "x2", "y2")):
-        x1 = _parse_float(row[idx["x1"]]) if idx["x1"] < len(row) else None
-        y1 = _parse_float(row[idx["y1"]]) if idx["y1"] < len(row) else None
-        x2 = _parse_float(row[idx["x2"]]) if idx["x2"] < len(row) else None
-        y2 = _parse_float(row[idx["y2"]]) if idx["y2"] < len(row) else None
-        if None in (x1, y1, x2, y2):
-            _warn(f"Skipping row frame={frame_idx}: missing/invalid x1,y1,x2,y2")
-            return None
-        w = x2 - x1
-        h = y2 - y1
-        if w <= 0 or h <= 0:
-            _warn(f"Skipping row frame={frame_idx}: non-positive width/height from corners (w={w}, h={h})")
-            return None
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        return (frame_idx, float(cx), float(cy), float(w), float(h))
-
-    # Should not reach here if indices were validated
-    _warn(f"Skipping row frame={frame_idx}: unsupported column configuration")
-    return None
+    s = str(val).strip()
+    return s if s else None
 
 
-def _size_metric_value(width: float, height: float, metric: str) -> float:
-    metric = (metric or "max").lower()
-    if metric == "min":
-        return float(min(width, height))
-    if metric == "diag":
-        return float(math.hypot(width, height))
-    # default max
-    return float(max(width, height))
-
-
-def _euclidean(ax: float, ay: float, bx: float, by: float) -> float:
-    dx = ax - bx
-    dy = ay - by
-    return math.hypot(dx, dy)
-
-
-def _read_csv_compute(records_path: str,
-                      size_metric: str,
-                      threshold_scale: float,
-                      per_frame: bool) -> Tuple[int, int, bool, List[Dict[str, Any]]]:
+def _validate_headers(headers: List[str]) -> bool:
     """
-    Read CSV, compute per-frame displacement and moved flag.
+    Validate that headers exactly match REQUIRED_HEADERS in order.
 
     Returns:
-        total_frames, num_motion_events, moved_any, per_frame_rows
-        per_frame_rows includes dicts with:
-            frame, cx, cy, width, height, size_metric, displacement, moved
+        bool: True if valid, False otherwise.
     """
-    if not os.path.exists(records_path) or not os.path.isfile(records_path):
-        _err(f"CSV file not found: {records_path}")
-        return 0, 0, False, []
+    if headers is None:
+        return False
+    return headers == REQUIRED_HEADERS
 
-    per_frame_rows: List[Dict[str, Any]] = []
 
-    with open(records_path, "r", newline="") as f:
-        reader = csv.reader(f)
-        try:
-            headers = next(reader)
-        except StopIteration:
-            _err(f"CSV file is empty: {records_path}")
-            return 0, 0, False, []
+def _normalize_label_list(labels_arg: Optional[str]) -> Optional[List[str]]:
+    """Convert comma-separated string into list of labels; return None if not provided."""
+    if not labels_arg:
+        return None
+    arr = [s.strip() for s in labels_arg.split(",")]
+    arr = [s for s in arr if s]  # remove empty
+    return arr if arr else None
 
-        idx = _detect_column_indices(headers)
-        if not idx:
-            _err("Failed to detect required columns. Expect one of:\n"
-                 "  - frame,cx,cy,w,h\n"
-                 "  - frame,x,y,w,h\n"
-                 "  - frame,x1,y1,x2,y2")
-            return 0, 0, False, []
 
-        parsed: List[Tuple[int, float, float, float, float]] = []
-        line_no = 1  # account for header
+def _row_to_detection(
+    row: Dict[str, str], quiet: bool
+) -> Optional[Dict[str, Any]]:
+    """
+    Convert a CSV DictReader row into a normalized detection dict.
+
+    Expected keys: time_frame_in_secs,label,x1,y1,x2,y2,confidence
+
+    Returns:
+        dict with keys:
+            - time_frame_in_secs (float)
+            - label (str)
+            - bbox: {x1,y1,x2,y2} (floats or ints depending on input)
+            - confidence (float)
+        or None if malformed.
+    """
+    # Parse time
+    t = _parse_float(row.get("time_frame_in_secs"))
+    if t is None:
+        _warn(f"Skipping row due to invalid time_frame_in_secs: {row.get('time_frame_in_secs')!r}", quiet)
+        return None
+
+    # Parse label
+    label = _parse_label(row.get("label"))
+    if label is None:
+        _warn("Skipping row due to missing/empty label", quiet)
+        return None
+
+    # Parse bbox coords
+    x1 = _parse_float(row.get("x1"))
+    y1 = _parse_float(row.get("y1"))
+    x2 = _parse_float(row.get("x2"))
+    y2 = _parse_float(row.get("y2"))
+    if None in (x1, y1, x2, y2):
+        _warn("Skipping row due to invalid bbox coordinates", quiet)
+        return None
+    # Ensure bbox is valid: allow x2<x1 or y2<y1? We'll accept as-is; caller logic may handle.
+    # If needed, we could normalize to min/max, but spec does not require.
+
+    # Parse confidence
+    conf = _parse_float(row.get("confidence"))
+    if conf is None:
+        _warn("Skipping row due to invalid confidence", quiet)
+        return None
+    if conf < 0.0 or conf > 1.0:
+        _warn(f"Skipping row due to confidence outside [0,1]: {conf}", quiet)
+        return None
+
+    det = {
+        "time_frame_in_secs": float(t),
+        "label": label,
+        "bbox": {
+            "x1": x1 if x1 is not None else 0.0,
+            "y1": y1 if y1 is not None else 0.0,
+            "x2": x2 if x2 is not None else 0.0,
+            "y2": y2 if y2 is not None else 0.0,
+        },
+        "confidence": float(conf),
+    }
+    return det
+
+
+# PUBLIC_INTERFACE
+def load_csv(
+    csv_path: str,
+    min_confidence: float = 0.0,
+    labels: Optional[List[str]] = None,
+    quiet: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Load and parse a detection CSV.
+
+    PUBLIC_INTERFACE
+    Args:
+        csv_path: Path to CSV file with headers exactly:
+                  time_frame_in_secs,label,x1,y1,x2,y2,confidence
+        min_confidence: Minimum confidence to include (0..1).
+        labels: Optional list of labels to include (exact match).
+        quiet: Suppress warnings/info if True.
+
+    Returns:
+        List of detection dicts:
+            {
+              "time_frame_in_secs": float,
+              "label": str,
+              "bbox": {"x1": float, "y1": float, "x2": float, "y2": float},
+              "confidence": float
+            }
+
+    Raises:
+        FileNotFoundError: If csv_path does not exist.
+        ValueError: If header validation fails.
+    """
+    if not os.path.exists(csv_path) or not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    detections: List[Dict[str, Any]] = []
+    total_rows = 0
+    malformed_rows = 0
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file is empty: {csv_path}")
+
+        if not _validate_headers(reader.fieldnames):
+            raise ValueError(
+                "Invalid CSV headers. Expected exactly:\n"
+                f"{','.join(REQUIRED_HEADERS)}\n"
+                f"Got: {','.join(reader.fieldnames)}"
+            )
+
         for row in reader:
-            line_no += 1
-            if not row or all((c is None or str(c).strip() == "") for c in row):
-                _warn(f"Skipping empty row at line {line_no}")
-                continue
-            try:
-                res = _compute_centroid_and_size(row, idx)
-                if res is not None:
-                    parsed.append(res)
-            except Exception as e:
-                _warn(f"Skipping row at line {line_no}: parse error ({e})")
+            total_rows += 1
+            det = _row_to_detection(row, quiet=quiet)
+            if det is None:
+                malformed_rows += 1
                 continue
 
-    if not parsed:
-        _warn("No valid rows found after parsing. Nothing to process.")
-        return 0, 0, False, []
+            # Filter by confidence
+            if float(det["confidence"]) < float(min_confidence):
+                continue
 
-    # Sort by frame index to ensure temporal order
-    parsed.sort(key=lambda t: t[0])
+            # Filter by labels if provided (exact match)
+            if labels is not None and det["label"] not in labels:
+                continue
 
-    total_frames = len(parsed)
-    motion_events = 0
-    moved_any = False
+            detections.append(det)
 
-    last_cx = None
-    last_cy = None
+    _print(
+        f"Parsed rows: {total_rows}, Malformed: {malformed_rows}, Valid detections after filters: {len(detections)}",
+        quiet,
+    )
+    return detections
 
-    for i, (frame, cx, cy, w, h) in enumerate(parsed):
-        size_val = _size_metric_value(w, h, size_metric)
-        threshold = threshold_scale * size_val
 
-        if last_cx is None or last_cy is None:
-            disp = 0.0
-            moved = False
-        else:
-            disp = _euclidean(cx, cy, last_cx, last_cy)
-            moved = disp > threshold
+# PUBLIC_INTERFACE
+def filter_detections(
+    detections: Iterable[Dict[str, Any]],
+    min_confidence: float = 0.0,
+    labels: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    PUBLIC_INTERFACE
+    Filter detections by confidence and labels.
 
-        if moved:
-            motion_events += 1
-            moved_any = True
+    Args:
+        detections: Iterable of detection dicts as produced by load_csv().
+        min_confidence: Minimum confidence threshold (inclusive).
+        labels: Optional list of allowed labels (exact match).
 
-        per_frame_rows.append({
-            "frame": frame,
-            "cx": cx,
-            "cy": cy,
-            "width": w,
-            "height": h,
-            "size_metric": size_val,
-            "displacement": disp,
-            "moved": moved,
-        })
+    Returns:
+        Filtered list of detections.
+    """
+    out: List[Dict[str, Any]] = []
+    for det in detections:
+        try:
+            conf_ok = float(det.get("confidence", 0.0)) >= float(min_confidence)
+            label_ok = (labels is None) or (det.get("label") in labels)
+            if conf_ok and label_ok:
+                out.append(det)
+        except Exception:
+            # If malformed, skip silently here.
+            continue
+    return out
 
-        last_cx, last_cy = cx, cy
 
-    return total_frames, motion_events, moved_any, per_frame_rows
+# PUBLIC_INTERFACE
+def group_by_frame(
+    detections: Iterable[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    PUBLIC_INTERFACE
+    Group detections by their time_frame_in_secs value (stringified).
+
+    Args:
+        detections: Iterable of detection dicts.
+
+    Returns:
+        Dict mapping "time_frame_in_secs" (as string) to list of detection dicts
+        with the shape: {"label": str, "bbox": {...}, "confidence": float}
+
+    Notes:
+        - Keys are strings for JSON friendliness ("0.0" etc.).
+        - The items in the grouped lists contain only label, bbox, confidence.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for det in detections:
+        t = det.get("time_frame_in_secs")
+        try:
+            t_str = f"{float(t):.6f}"  # stable string representation
+        except Exception:
+            # If time is invalid, skip
+            continue
+
+        grouped.setdefault(t_str, []).append(
+            {
+                "label": det.get("label"),
+                "bbox": {
+                    "x1": det.get("bbox", {}).get("x1"),
+                    "y1": det.get("bbox", {}).get("y1"),
+                    "x2": det.get("bbox", {}).get("x2"),
+                    "y2": det.get("bbox", {}).get("y2"),
+                },
+                "confidence": det.get("confidence"),
+            }
+        )
+    return grouped
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Build CLI argument parser for the CSV-based detection loader.
+    """
     parser = argparse.ArgumentParser(
-        description="Determine bear motion based on centroid displacement vs bounding-box size threshold.",
+        description="Parse CSV YOLO detections and optionally group, filter, and export JSON.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-CSV columns accepted (case-insensitive):
-  (1) frame,cx,cy,w,h
-  (2) frame,x,y,w,h
-  (3) frame,x1,y1,x2,y2
-
-Rules:
-  - Centroid is computed per row.
-  - Displacement is Euclidean distance between consecutive valid frame centroids.
-  - A frame is considered 'moved' if displacement > threshold_scale * size_metric(width,height)
-  - size_metric can be one of:
-      * max  : max(width, height)         [default]
-      * min  : min(width, height)
-      * diag : sqrt(width^2 + height^2)
+CSV requirements:
+  Headers exactly: time_frame_in_secs,label,x1,y1,x2,y2,confidence
 
 Examples:
-  Basic:
-    python detect_bear_motion.py ./boxes.csv
-
-  Use diagonal metric with scale 0.75 and print per-frame details:
-    python detect_bear_motion.py ./boxes.csv --size-metric diag --threshold-scale 0.75 --per-frame
-
-  Use max metric with scale 1.5:
-    python detect_bear_motion.py ./boxes.csv --size-metric max --threshold-scale 1.5
-"""
+  python detect_bear_motion.py --csv dets.csv
+  python detect_bear_motion.py --csv dets.csv --min-confidence 0.5 --labels bear
+  python detect_bear_motion.py --csv dets.csv --grouping flat --output out.json
+  python detect_bear_motion.py --csv dets.csv --grouping frame --output out.json --quiet
+""",
     )
     parser.add_argument(
-        "csv_path",
-        help="Path to CSV file with frame and bounding box columns."
+        "--csv",
+        required=True,
+        help="Path to the metadata CSV (required).",
     )
     parser.add_argument(
-        "--threshold-scale",
+        "--video",
+        help="Optional video path; accepted for future frame extraction needs (not used in this script).",
+        default=None,
+    )
+    parser.add_argument(
+        "--min-confidence",
         type=float,
-        default=1.0,
-        help="Scale factor multiplied by the chosen size metric per frame (default: 1.0)."
+        default=0.0,
+        help="Minimum confidence threshold to include (default: 0.0).",
     )
     parser.add_argument(
-        "--size-metric",
-        choices=["max", "min", "diag"],
-        default="max",
-        help="Bounding box size metric to compare against (default: max)."
+        "--labels",
+        type=str,
+        default=None,
+        help="Comma-separated labels to include (exact match). Example: 'bear,dog'",
     )
     parser.add_argument(
-        "--per-frame",
+        "--grouping",
+        choices=["frame", "flat"],
+        default="frame",
+        help="Grouping mode: 'frame' to group detections by time_frame_in_secs, 'flat' to emit all detections (default: frame).",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="If provided, write normalized JSON to this path.",
+    )
+    parser.add_argument(
+        "--quiet",
         action="store_true",
-        help="Print per-frame CSV (frame,cx,cy,width,height,size_metric,displacement,moved) to stdout."
+        help="Suppress verbose messages and warnings.",
     )
     return parser
 
 
+def _summary(detections: List[Dict[str, Any]], quiet: bool) -> Tuple[int, int, Optional[float], Optional[float]]:
+    """
+    Compute summary metrics for detections.
+
+    Returns:
+        total_rows (int), frames_found (int), min_ts (float|None), max_ts (float|None)
+    """
+    total_rows = len(detections)
+    frames = set()
+    min_ts: Optional[float] = None
+    max_ts: Optional[float] = None
+    for det in detections:
+        t = det.get("time_frame_in_secs")
+        try:
+            tf = float(t)
+        except Exception:
+            # Skip time aggregation for malformed time
+            continue
+        frames.add(tf)
+        min_ts = tf if min_ts is None else min(min_ts, tf)
+        max_ts = tf if max_ts is None else max(max_ts, tf)
+
+    frames_found = len(frames)
+    return total_rows, frames_found, min_ts, max_ts
+
+
+def _write_json(
+    path: str,
+    grouping: str,
+    grouped_or_flat: Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]],
+    quiet: bool,
+) -> None:
+    """
+    Write normalized JSON output to path.
+
+    JSON structure:
+      {
+        "schema": "bear_motion_v1",
+        "grouping": "frame" | "flat",
+        "detections": {... or [...]}
+      }
+    """
+    payload = {
+        "schema": "bear_motion_v1",
+        "grouping": grouping,
+        "detections": grouped_or_flat,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        _print(f"Wrote JSON to: {path}", quiet)
+    except Exception as e:
+        _err(f"Failed to write JSON to {path}: {e}")
+
+
+# PUBLIC_INTERFACE
+def iter_detections_per_frame(
+    detections: Iterable[Dict[str, Any]]
+) -> Iterator[Tuple[float, List[Dict[str, Any]]]]:
+    """
+    PUBLIC_INTERFACE
+    Provide an iteration API to process detections per frame.
+
+    Yields:
+        (time_frame_in_secs, detections_for_frame)
+        where detections_for_frame are detection dicts of the form returned by load_csv().
+
+    Notes:
+        - Frames are yielded in ascending time order.
+    """
+    by_frame: Dict[float, List[Dict[str, Any]]] = {}
+    for det in detections:
+        try:
+            t = float(det.get("time_frame_in_secs"))
+        except Exception:
+            # Skip malformed
+            continue
+        by_frame.setdefault(t, []).append(det)
+
+    for t in sorted(by_frame.keys()):
+        yield t, by_frame[t]
+
+
 # PUBLIC_INTERFACE
 def main() -> None:
-    """CLI entrypoint to detect motion from a CSV of bounding boxes.
+    """
+    CLI entrypoint to parse CSV detections, filter, group, and optionally export JSON.
 
-    Parameters:
-        csv_path (positional): Path to CSV with bounding box columns.
-        --threshold-scale (float): Multiplier for size metric (default 1.0).
-        --size-metric (str): One of max|min|diag (default max).
-        --per-frame (flag): If set, prints per-frame CSV to stdout.
-
-    Output:
-        - If --per-frame is set, prints a CSV header and per-frame rows:
-            frame,cx,cy,width,height,size_metric,displacement,moved
-        - Always prints a summary:
-            Total frames: <N>
-            Motion events: <K>
-            MOVED: True|False
+    CLI:
+      --csv <path> (required)
+      --video <path> (optional; not used by this script beyond acceptance)
+      --min-confidence <float> (default 0.0)
+      --labels <comma-separated> (optional, exact match)
+      --grouping <frame|flat> (default 'frame')
+      --output <path> (optional)
+      --quiet (flag) suppresses informational prints and warnings
 
     Behavior:
-        - Skips malformed rows with warnings.
-        - Sorts frames by the 'frame' value.
-        - The first valid frame has no previous frame, so displacement is 0 and moved=False.
+      - Validates required headers.
+      - Parses rows robustly and skips malformed with warnings (unless quiet).
+      - Filters by confidence and labels if provided.
+      - If grouping == 'frame', produce a dict keyed by time string with arrays of {label,bbox,confidence}.
+      - If grouping == 'flat', produce a list of normalized detection dicts.
+      - If --output is provided, write the normalized JSON to the file.
+
+    Summary printed:
+      - Total rows (valid detections after filters)
+      - Frames found
+      - Min/Max timestamps
     """
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    total, motions, moved, rows = _read_csv_compute(
-        records_path=args.csv_path,
-        size_metric=args.size_metric,
-        threshold_scale=float(args.threshold_scale),
-        per_frame=bool(args.per_frame),
-    )
+    csv_path = args.csv
+    # Note: args.video is accepted for future frame extraction needs but not used here.
+    quiet = bool(args.quiet)
 
-    if args.per_frame:
-        # Print per-frame CSV
-        out = csv.writer(sys.stdout)
-        out.writerow(["frame", "cx", "cy", "width", "height", "size_metric", "displacement", "moved"])
-        for r in rows:
-            out.writerow([
-                r["frame"],
-                f"{r['cx']:.6f}",
-                f"{r['cy']:.6f}",
-                f"{r['width']:.6f}",
-                f"{r['height']:.6f}",
-                f"{r['size_metric']:.6f}",
-                f"{r['displacement']:.6f}",
-                "True" if r["moved"] else "False",
-            ])
+    # Parse label filters
+    labels = _normalize_label_list(args.labels)
 
-    # Print summary (human-readable)
-    print(f"Total frames: {total}")
-    print(f"Motion events: {motions}")
-    print(f"MOVED: {bool(moved)}")
+    try:
+        detections = load_csv(
+            csv_path=csv_path,
+            min_confidence=float(args["min_confidence"]) if isinstance(args, dict) and "min_confidence" in args else float(args.min_confidence),
+            labels=labels,
+            quiet=quiet,
+        )
+    except FileNotFoundError as e:
+        _err(str(e))
+        sys.exit(1)
+    except ValueError as e:
+        _err(str(e))
+        sys.exit(2)
+    except Exception as e:
+        _err(f"Unexpected error during CSV load: {e}")
+        sys.exit(1)
+
+    # At this point detections are already filtered by min-confidence and labels inside load_csv.
+    # If we wanted to apply additional filtering externally, we could call filter_detections again.
+
+    # Group or keep flat
+    if args.grouping == "frame":
+        grouped = group_by_frame(detections)
+        grouped_or_flat: Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]] = grouped
+    else:
+        grouped_or_flat = detections
+
+    # Write JSON if requested
+    if args.output:
+        _write_json(args.output, args.grouping, grouped_or_flat, quiet)
+
+    # Compute and print summary
+    total_rows, frames_found, min_ts, max_ts = _summary(detections, quiet)
+
+    print(f"Total rows: {total_rows}")
+    print(f"Frames found: {frames_found}")
+    if min_ts is not None and max_ts is not None:
+        print(f"Min timestamp: {min_ts}")
+        print(f"Max timestamp: {max_ts}")
+    else:
+        print("Min timestamp: N/A")
+        print("Max timestamp: N/A")
 
 
 if __name__ == "__main__":
+    # Ensure module is import-safe
     main()
