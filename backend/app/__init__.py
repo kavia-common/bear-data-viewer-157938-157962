@@ -4,33 +4,40 @@ from flask_cors import CORS
 from .routes.health import blp as health_blp
 from .routes.bears import blp as bears_blp
 from flask_smorest import Api
+from .middleware import apply_api_cors_headers  # optional safety middleware
 
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# Configure CORS to allow only the specified frontend origin by default.
-# You can set CORS_ALLOWED_ORIGINS in the environment as a comma-separated list of origins to override.
-allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
-if allowed_origins_env:
-    allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+# Configure CORS using BACKEND_CORS_ORIGINS (comma-separated). If unset, default to the frontend origin.
+# Note: Do not hardcode secrets. Origins are not secret.
+origins_env = os.getenv("BACKEND_CORS_ORIGINS")
+if origins_env:
+    allowed_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
 else:
-    # Restrict to the deployed frontend preview origin (port 3000)
     allowed_origins = [
         "https://vscode-internal-20401-qa.qa01.cloud.kavia.ai:3000",
     ]
 
-# Apply CORS only to API routes and include standard methods/headers to satisfy preflight.
+# Apply CORS only to /api/* and include standard methods/headers to satisfy preflight.
+# Expose Content-Type for clients that need to read it.
 CORS(
     app,
-    resources={r"/api/*": {
-        "origins": allowed_origins,
-        "methods": ["GET", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": False,
-        "max_age": 600
-    }},
+    resources={
+        r"/api/*": {
+            "origins": allowed_origins,
+            "methods": ["GET", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "expose_headers": ["Content-Type"],
+            "supports_credentials": False,  # enable True only if cookies/credentials are needed
+            "max_age": 600,
+        }
+    },
 )
+
+# Optional middleware to ensure CORS headers are present for /api/* responses even if a custom response path is used.
+apply_api_cors_headers(app, allowed_origins, supports_credentials=False)
 
 # OpenAPI/Swagger configuration
 app.config["API_TITLE"] = "My Flask API"

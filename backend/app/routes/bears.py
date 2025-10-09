@@ -2,6 +2,10 @@ from flask_smorest import Blueprint
 from flask.views import MethodView
 from marshmallow import Schema, fields
 from datetime import datetime, timezone, timedelta
+from flask import request, make_response, jsonify
+import logging
+
+logger = logging.getLogger("bears")
 
 blp = Blueprint(
     "Bears",
@@ -40,6 +44,19 @@ class BearList(MethodView):
         Returns:
             list[dict]: A list of bear records suitable for JSON serialization.
         """
+        # Minimal, concise logging of inbound request info for CORS verification (no secrets).
+        try:
+            logger.info(
+                "GET /api/bears | Origin=%s, Method=%s, ReqHeaders={Origin:%s, Content-Type:%s, Authorization:%s}",
+                request.headers.get("Origin"),
+                request.method,
+                request.headers.get("Origin"),
+                request.headers.get("Content-Type"),
+                "present" if request.headers.get("Authorization") else "absent",
+            )
+        except Exception:
+            pass
+
         now = datetime.now(timezone.utc)
         # Return Python datetime objects; Marshmallow will serialize to ISO 8601 strings.
         data = [
@@ -47,7 +64,22 @@ class BearList(MethodView):
             {"bearId": "B002", "pose": "Standing", "timestamp": (now - timedelta(seconds=15))},
             {"bearId": "B003", "pose": "Walking", "timestamp": (now - timedelta(seconds=25))},
         ]
-        return data
+
+        # Build response so we can log the final headers (CORS verification).
+        response = make_response(jsonify(data), 200)
+        # Note: flask-cors should inject headers; we only log here.
+        try:
+            logger.info(
+                "RESP /api/bears | Status=200, CORS={Origin:%s, Methods:%s, Headers:%s, Expose:%s, Credentials:%s}",
+                response.headers.get("Access-Control-Allow-Origin"),
+                response.headers.get("Access-Control-Allow-Methods"),
+                response.headers.get("Access-Control-Allow-Headers"),
+                response.headers.get("Access-Control-Expose-Headers"),
+                response.headers.get("Access-Control-Allow-Credentials"),
+            )
+        except Exception:
+            pass
+        return response
 
     # Document response schema via flask-smorest
     get = blp.response(
