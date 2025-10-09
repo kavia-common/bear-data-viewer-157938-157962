@@ -328,10 +328,10 @@ def group_by_frame(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     """
-    Build CLI argument parser for the CSV-based detection loader.
+    Build CLI argument parser for the CSV-based detection loader and movement detector.
     """
     parser = argparse.ArgumentParser(
-        description="Parse CSV YOLO detections and optionally group, filter, and export JSON.",
+        description="Parse CSV YOLO detections and optionally group, filter, export JSON, and detect movement across frames.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 CSV requirements:
@@ -342,6 +342,8 @@ Examples:
   python detect_bear_motion.py --csv dets.csv --min-confidence 0.5 --labels bear
   python detect_bear_motion.py --csv dets.csv --grouping flat --output out.json
   python detect_bear_motion.py --csv dets.csv --grouping frame --output out.json --quiet
+  python detect_bear_motion.py --csv dets.csv --move-threshold 12.0 --match-method centroid
+  python detect_bear_motion.py --csv dets.csv --match-method iou --iou-threshold 0.4
 """,
     )
     parser.add_argument(
@@ -382,6 +384,26 @@ Examples:
         "--quiet",
         action="store_true",
         help="Suppress verbose messages and warnings.",
+    )
+    # Movement detection options
+    parser.add_argument(
+        "--move-threshold",
+        type=float,
+        default=10.0,
+        help="Movement distance threshold in pixels for centroid displacement (default: 10.0).",
+    )
+    parser.add_argument(
+        "--match-method",
+        type=str,
+        choices=["centroid", "iou"],
+        default="centroid",
+        help="Association method between consecutive frames: centroid or iou (default: centroid).",
+    )
+    parser.add_argument(
+        "--iou-threshold",
+        type=float,
+        default=0.3,
+        help="IoU threshold used when --match-method iou is selected (default: 0.3).",
     )
     return parser
 
