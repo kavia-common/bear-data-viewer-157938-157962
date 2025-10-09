@@ -22,9 +22,12 @@ class BearSchema(Schema):
     )
 
 
-@blp.route("/bears")
+@blp.route("/bears", methods=["GET", "OPTIONS"])
 class BearList(MethodView):
-    """Provide read-only access to mock Bear data."""
+    """Provide read-only access to mock Bear data.
+
+    CORS: Preflight (OPTIONS) is handled by flask-cors configuration at the app level.
+    """
 
     # PUBLIC_INTERFACE
     def get(self):

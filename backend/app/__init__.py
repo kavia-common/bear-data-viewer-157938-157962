@@ -15,16 +15,21 @@ allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
 if allowed_origins_env:
     allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
 else:
-    # Restrict to the deployed frontend preview origins (ports 3000 and 4000)
+    # Restrict to the deployed frontend preview origin (port 3000)
     allowed_origins = [
-        "https://vscode-internal-25817-beta.beta01.cloud.kavia.ai:3000",
-        "https://vscode-internal-25817-beta.beta01.cloud.kavia.ai:4000",
+        "https://vscode-internal-20401-qa.qa01.cloud.kavia.ai:3000",
     ]
 
-# Apply CORS only to API routes.
+# Apply CORS only to API routes and include standard methods/headers to satisfy preflight.
 CORS(
     app,
-    resources={r"/api/*": {"origins": allowed_origins}},
+    resources={r"/api/*": {
+        "origins": allowed_origins,
+        "methods": ["GET", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": False,
+        "max_age": 600
+    }},
 )
 
 # OpenAPI/Swagger configuration
