@@ -4,6 +4,7 @@ from flask_cors import CORS
 from .routes.health import blp as health_blp
 from .routes.bears import blp as bears_blp
 from .routes.health_dataset import blp as dataset_health_blp
+from .routes.results import blp as results_blp
 from flask_smorest import Api
 from .middleware import apply_api_cors_headers  # optional safety middleware
 
@@ -52,3 +53,4 @@ api = Api(app)
 api.register_blueprint(health_blp)
 api.register_blueprint(bears_blp)
 api.register_blueprint(dataset_health_blp)
+api.register_blueprint(results_blp)
