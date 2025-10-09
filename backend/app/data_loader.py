@@ -35,6 +35,7 @@ def load_detections() -> Tuple[List[Dict[str, Any]], datetime]:
 
 
 def _load_from_csv(path: str) -> List[Dict[str, Any]]:
+    """Load detections from CSV ensuring correct types."""
     rows: List[Dict[str, Any]] = []
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -44,15 +45,25 @@ def _load_from_csv(path: str) -> List[Dict[str, Any]]:
             raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
         for r in reader:
             try:
-                rows.append({
-                    "frame_time_seconds": float(r["frame_time_seconds"]),
-                    "label": str(r["label"]),
-                    "x1": float(r["x1"]),
-                    "y1": float(r["y1"]),
-                    "x2": float(r["x2"]),
-                    "y2": float(r["y2"]),
-                    "confidence": float(r["confidence"]),
-                })
+                # Coerce to required types: time->float, coords->float, conf->float, label->str
+                frame_time = float(r["frame_time_seconds"])
+                label = str(r["label"])
+                x1 = float(r["x1"])
+                y1 = float(r["y1"])
+                x2 = float(r["x2"])
+                y2 = float(r["y2"])
+                conf = float(r["confidence"])
+                rows.append(
+                    {
+                        "frame_time_seconds": frame_time,
+                        "label": label,
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                        "confidence": conf,
+                    }
+                )
             except Exception:
                 # Skip bad rows; production could log these
                 continue
@@ -60,19 +71,23 @@ def _load_from_csv(path: str) -> List[Dict[str, Any]]:
 
 
 def _load_from_embedded_sample() -> List[Dict[str, Any]]:
-    """Embedded sample dataset.
+    """Embedded seed dataset matching expected columns and types.
 
-    Replace or extend with user-provided rows as needed. These are example detections.
+    Types:
+      - frame_time_seconds: float (seconds)
+      - label: str
+      - x1, y1, x2, y2: float (from provided int coordinates)
+      - confidence: float
     """
-    sample: List[Dict[str, Any]] = [
-        # frame_time_seconds, label, x1, y1, x2, y2, confidence
-        {"frame_time_seconds": 1.0, "label": "bear", "x1": 10, "y1": 20, "x2": 110, "y2": 220, "confidence": 0.92},
-        {"frame_time_seconds": 2.5, "label": "bear", "x1": 15, "y1": 25, "x2": 120, "y2": 230, "confidence": 0.88},
-        {"frame_time_seconds": 3.8, "label": "deer", "x1": 50, "y1": 60, "x2": 180, "y2": 260, "confidence": 0.81},
-        {"frame_time_seconds": 4.2, "label": "bear", "x1": 12, "y1": 22, "x2": 115, "y2": 225, "confidence": 0.61},
-        {"frame_time_seconds": 5.1, "label": "fox",  "x1": 80, "y1": 90, "x2": 150, "y2": 200, "confidence": 0.73},
+    # Static seed rows. Coordinates provided as ints are stored as floats for consistency.
+    seed: List[Dict[str, Any]] = [
+        {"frame_time_seconds": float(1), "label": "bear", "x1": float(10), "y1": float(20), "x2": float(110), "y2": float(220), "confidence": 0.92},
+        {"frame_time_seconds": float(2), "label": "bear", "x1": float(15), "y1": float(25), "x2": float(120), "y2": float(230), "confidence": 0.88},
+        {"frame_time_seconds": float(3), "label": "deer", "x1": float(50), "y1": float(60), "x2": float(180), "y2": float(260), "confidence": 0.81},
+        {"frame_time_seconds": float(4), "label": "bear", "x1": float(12), "y1": float(22), "x2": float(115), "y2": float(225), "confidence": 0.61},
+        {"frame_time_seconds": float(5), "label": "fox",  "x1": float(80), "y1": float(90), "x2": float(150), "y2": float(200), "confidence": 0.73},
     ]
-    return sample
+    return seed
 
 
 # PUBLIC_INTERFACE

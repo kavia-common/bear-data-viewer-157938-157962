@@ -69,3 +69,23 @@ def test_dataset_health(client):
     payload = resp.get_json()
     assert payload["status"] == "ok"
     assert isinstance(payload["count"], int)
+
+
+def test_seed_returns_non_empty_for_bears_and_detections(client):
+    """
+    Ensure that seeded in-memory dataset returns at least one record for /api/bears
+    and that /api/detections returns overall records without requiring a CSV.
+    """
+    rb = client.get("/api/bears")
+    assert rb.status_code == 200
+    jb = rb.get_json()
+    assert jb["count"] >= 1
+    assert len(jb["detections"]) >= 1
+    for det in jb["detections"]:
+        assert det["label"] == "bear"
+
+    rd = client.get("/api/detections")
+    assert rd.status_code == 200
+    jd = rd.get_json()
+    assert jd["count"] >= 1
+    assert len(jd["detections"]) >= 1
