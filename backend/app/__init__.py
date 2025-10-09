@@ -17,8 +17,8 @@ if allowed_origins_env:
 else:
     # Restrict to the deployed frontend preview origins (ports 3000 and 4000)
     allowed_origins = [
-        "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:3000",
-        "https://vscode-internal-14781-beta.beta01.cloud.kavia.ai:4000",
+        "https://vscode-internal-25817-beta.beta01.cloud.kavia.ai:3000",
+        "https://vscode-internal-25817-beta.beta01.cloud.kavia.ai:4000",
     ]
 
 # Apply CORS only to API routes.
