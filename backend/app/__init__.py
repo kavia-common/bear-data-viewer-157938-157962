@@ -21,13 +21,13 @@ else:
         "https://vscode-internal-25817-beta.beta01.cloud.kavia.ai:4000",
     ]
 
-# Apply CORS only to API routes.
+# Apply CORS to API routes. Adjust CORS_ALLOWED_ORIGINS env var to override.
 CORS(
     app,
     resources={r"/api/*": {"origins": allowed_origins}},
 )
 
-# OpenAPI/Swagger configuration
+# OpenAPI/Swagger configuration and docs mounting at /docs
 app.config["API_TITLE"] = "My Flask API"
 app.config["API_VERSION"] = "v1"
 app.config["OPENAPI_VERSION"] = "3.0.3"
@@ -36,5 +36,6 @@ app.config["OPENAPI_SWAGGER_UI_PATH"] = ""
 app.config["OPENAPI_SWAGGER_UI_URL"] = "https://cdn.jsdelivr.net/npm/swagger-ui-dist/"
 
 api = Api(app)
+# Add explicit tags metadata if needed in future via flask-smorest
 api.register_blueprint(health_blp)
 api.register_blueprint(bears_blp)
