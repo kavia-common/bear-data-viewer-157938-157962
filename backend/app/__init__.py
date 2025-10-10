@@ -9,8 +9,8 @@ from flask_smorest import Api
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# Restore original CORS behavior: allow same-origin and default dev origin via flask-cors
-# Do not rely on BACKEND_CORS_ORIGINS introduced with dataset changes.
+# Restore original CORS behavior: allow any origin for /api/* to simplify local dev and container preview.
+# For production, tighten this to specific origins (e.g., ["http://localhost:3000"]).
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
