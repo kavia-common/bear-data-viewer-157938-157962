@@ -8,30 +8,19 @@ This module provides:
 3) Activity classification into sleeping/standing/moving via:
    - Heuristic fallback (no scikit-learn required), or
    - ML model (RandomForest) with optional training.
-4) CLI utilities:
-   - estimate: run pose estimation (real DLC or mock).
-   - classify: end-to-end pose -> features -> predictions.
-   - train: train a classifier from labeled CSVs.
+4) Execution controlled via a hardcoded configuration in main():
+   - mode: 'estimate' | 'classify' | 'train'
+   - paths: input_path, output_dir, optional model paths, training CSV lists
+   - options: use_mock (True/False), fps, DLC shuffle/trainingsetindex
 
 The code includes dependency checks and mock/stub fallbacks for DLC and sklearn.
-If DLC is not installed and use_mock=False, a clear error is raised; use --mock to
-simulate DLC output for development/testing.
+If DLC is not installed and use_mock=False, a clear error is raised. Set use_mock=True
+in the main() configuration to simulate DLC output for development/testing.
 
-Usage examples:
-- Run pose estimation (DLC installed):
-    python bear_activity_classifier.py estimate --input /path/to/video.mp4 --out out_dir
-
-- Run pose estimation in mock mode:
-    python bear_activity_classifier.py estimate --input /path/to/video.mp4 --out out_dir --mock
-
-- Classify with heuristic (no trained model):
-    python bear_activity_classifier.py classify --input /path/to/video.mp4 --out out_dir --mock
-
-- Classify with trained model:
-    python bear_activity_classifier.py classify --input /path/to/video.mp4 --out out_dir --model out_dir/model.joblib
-
-- Train a model from DLC CSV(s) and label CSV(s):
-    python bear_activity_classifier.py train --dlc_csvs dlc1.csv dlc2.csv --label_csvs lab1.csv lab2.csv --out_model out_dir/model.joblib
+How to use (no CLI args):
+- Open this file and edit the CONFIG section inside main() to your needs.
+- Then run:
+    python backend/bear_activity_classifier.py
 
 Notes:
 - DLC CSV format: MultiIndex columns [scorer, bodypart, coords], coords in [x, y, likelihood].
@@ -46,7 +35,6 @@ Environment & Dependencies:
 
 from __future__ import annotations
 
-import argparse
 import sys
 import warnings
 import json
@@ -70,7 +58,7 @@ try:
 except Exception:
     dlc = None
     _DLC_AVAILABLE = False
-    warnings.warn("DeepLabCut not available. Use --mock for simulated pose estimation output.")
+    warnings.warn("DeepLabCut not available. Enable use_mock=True in main() for simulated pose estimation output.")
 
 try:
     from sklearn.ensemble import RandomForestClassifier  # type: ignore
@@ -230,7 +218,9 @@ def run_pose_estimation(
     output_dir: str,
     use_mock: bool = False,
     shuffle: int = 1,
-    trainingsetindex: int = 0
+    trainingsetindex: int = 0,
+    dlc_project_path: Optional[str] = None,
+    dlc_model_path: Optional[str] = None
 ) -> str:
     """Run DeepLabCut pose estimation or mock generation.
 
@@ -258,6 +248,12 @@ def run_pose_estimation(
         If DLC is not available and use_mock is False.
     FileNotFoundError
         If input_path does not exist.
+
+    Notes
+    -----
+    dlc_project_path/dlc_model_path are optional. If not provided and DLC is enabled,
+    the function will rely on DLC environment defaults. If DLC is unavailable or
+    use_mock=True, a synthetic CSV will be generated.
     """
     input_p = Path(input_path)
     out_dir = Path(output_dir)
@@ -278,11 +274,12 @@ def run_pose_estimation(
     # DLC real inference
     if not use_mock and _DLC_AVAILABLE:
         # Validate DLC project/model if provided
-        if DLC_PROJECT_PATH is None:
+        config_path = dlc_project_path if dlc_project_path is not None else DLC_PROJECT_PATH
+        if config_path is None:
             warnings.warn(
-                "DLC_PROJECT_PATH is not set. Using DLC defaults; ensure your environment is configured."
+                "DLC project path is not set. Using DLC defaults; ensure your environment is configured."
             )
-        config_path = DLC_PROJECT_PATH
+        # dlc_model_path is kept for possible future advanced calls; standard DLC API may not need it explicitly.
 
         # Prepare list of items for DLC
         if is_video:
@@ -655,7 +652,11 @@ def classify_bear_activity(
     output_dir: str,
     use_mock: bool = False,
     model_path: Optional[str] = None,
-    fps: int = FPS
+    fps: int = FPS,
+    dlc_project_path: Optional[str] = None,
+    dlc_model_path: Optional[str] = None,
+    shuffle: int = 1,
+    trainingsetindex: int = 0
 ) -> pd.DataFrame:
     """Run end-to-end: pose estimation -> features -> classification.
 
@@ -676,11 +677,24 @@ def classify_bear_activity(
     -------
     pandas.DataFrame
         DataFrame with columns: frame, timestamp, predicted_label.
+
+    Notes
+    -----
+    dlc_project_path/dlc_model_path parameters are forwarded to pose estimation.
+    If DLC is not available or use_mock=True, a synthetic DLC CSV will be used.
     """
     out_dir = Path(output_dir)
     _ensure_dir(out_dir)
 
-    dlc_csv = run_pose_estimation(input_path=input_path, output_dir=output_dir, use_mock=use_mock)
+    dlc_csv = run_pose_estimation(
+        input_path=input_path,
+        output_dir=output_dir,
+        use_mock=use_mock,
+        shuffle=shuffle,
+        trainingsetindex=trainingsetindex,
+        dlc_project_path=dlc_project_path,
+        dlc_model_path=dlc_model_path
+    )
     features = extract_features_from_dlc_csv(dlc_csv, fps=fps)
 
     # timestamp from frame index and FPS
@@ -783,98 +797,114 @@ def train_activity_model(
 
 
 # ==================================
-# CLI
+# Main (hardcoded configuration)
 # ==================================
 
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Bear Activity Classifier with DeepLabCut or mock fallback."
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+# PUBLIC_INTERFACE
+def main() -> int:
+    """
+    Entry point without CLI arguments.
 
-    # estimate
-    p_est = sub.add_parser("estimate", help="Run pose estimation only (DLC or mock).")
-    p_est.add_argument("--input", required=True, help="Path to video file or image directory.")
-    p_est.add_argument("--out", required=True, help="Output directory for DLC CSV.")
-    p_est.add_argument("--mock", action="store_true", help="Use mock DLC output.")
-    p_est.add_argument("--shuffle", type=int, default=1, help="DLC shuffle parameter.")
-    p_est.add_argument("--trainingsetindex", type=int, default=0, help="DLC trainingsetindex parameter.")
+    Edit the CONFIG block below to control behavior.
 
-    # classify
-    p_cls = sub.add_parser("classify", help="End-to-end: pose -> features -> predictions.")
-    p_cls.add_argument("--input", required=True, help="Path to video file or image directory.")
-    p_cls.add_argument("--out", required=True, help="Output directory for predictions.")
-    p_cls.add_argument("--mock", action="store_true", help="Use mock DLC output.")
-    p_cls.add_argument("--model", default=None, help="Path to trained model (.joblib).")
-    p_cls.add_argument("--fps", type=int, default=FPS, help="Frames per second for features.")
+    CONFIG keys:
+    - mode: 'estimate' | 'classify' | 'train'
+    - input_path: path to video file or image directory (for estimate/classify)
+    - output_dir: directory to write outputs (CSV, predictions, model)
+    - use_mock: True to simulate DLC output
+    - fps: frames per second for features/velocity
+    - model_path: path to trained model (.joblib) for classification (optional)
+    - dlc_project_path: path to DLC config/project (optional)
+    - dlc_model_path: path to specific DLC model (optional, not always needed)
+    - shuffle: DLC shuffle parameter (int)
+    - trainingsetindex: DLC trainingsetindex parameter (int)
+    - dlc_csvs: list of DLC CSV paths for training
+    - label_csvs: list of label CSV paths for training
+    - out_model: model output path for training
+    """
+    # ======== CONFIG: EDIT THESE VALUES ========
+    CONFIG = {
+        # Choose one of: 'estimate', 'classify', 'train'
+        "mode": "classify",
 
-    # train
-    p_tr = sub.add_parser("train", help="Train a model from DLC CSVs and label CSVs.")
-    p_tr.add_argument("--dlc_csvs", nargs="+", required=True, help="List of DLC CSV paths.")
-    p_tr.add_argument("--label_csvs", nargs="+", required=True, help="List of label CSV paths.")
-    p_tr.add_argument("--out_model", required=True, help="Output path for trained model (.joblib).")
-    p_tr.add_argument("--fps", type=int, default=FPS, help="Frames per second for features.")
+        # Common paths
+        "input_path": "sample_data/video.mp4",    # path to video or image dir
+        "output_dir": "outputs",                 # directory to write CSVs/predictions
 
-    return parser.parse_args(argv)
+        # DLC options
+        "use_mock": True,                        # set True to bypass DLC and use synthetic CSV
+        "dlc_project_path": None,                # e.g., "/path/to/DLC/project/config.yaml"
+        "dlc_model_path": None,                  # optional; DLC often doesn't require explicit model path
+        "shuffle": 1,
+        "trainingsetindex": 0,
 
+        # Feature options
+        "fps": 30,
 
-def _cmd_estimate(args: argparse.Namespace) -> int:
+        # Classification (ML) options
+        "model_path": None,                      # e.g., "outputs/model.joblib" (if available)
+
+        # Training options
+        "dlc_csvs": ["train/dlc1.csv", "train/dlc2.csv"],
+        "label_csvs": ["train/lab1.csv", "train/lab2.csv"],
+        "out_model": "outputs/model.joblib",
+    }
+    # ======== END CONFIG ========
+
+    mode = CONFIG.get("mode", "classify")
+
     try:
-        csv_path = run_pose_estimation(
-            input_path=args.input,
-            output_dir=args.out,
-            use_mock=args.mock,
-            shuffle=args.shuffle,
-            trainingsetindex=args.trainingsetindex
-        )
-        print(json.dumps({"status": "ok", "csv": csv_path}))
-        return 0
+        if mode == "estimate":
+            csv_path = run_pose_estimation(
+                input_path=str(CONFIG["input_path"]),
+                output_dir=str(CONFIG["output_dir"]),
+                use_mock=bool(CONFIG.get("use_mock", False)),
+                shuffle=int(CONFIG.get("shuffle", 1)),
+                trainingsetindex=int(CONFIG.get("trainingsetindex", 0)),
+                dlc_project_path=CONFIG.get("dlc_project_path"),
+                dlc_model_path=CONFIG.get("dlc_model_path"),
+            )
+            print(json.dumps({"status": "ok", "mode": "estimate", "csv": csv_path}))
+            return 0
+
+        elif mode == "classify":
+            df = classify_bear_activity(
+                input_path=str(CONFIG["input_path"]),
+                output_dir=str(CONFIG["output_dir"]),
+                use_mock=bool(CONFIG.get("use_mock", False)),
+                model_path=CONFIG.get("model_path"),
+                fps=int(CONFIG.get("fps", FPS)),
+                dlc_project_path=CONFIG.get("dlc_project_path"),
+                dlc_model_path=CONFIG.get("dlc_model_path"),
+                shuffle=int(CONFIG.get("shuffle", 1)),
+                trainingsetindex=int(CONFIG.get("trainingsetindex", 0)),
+            )
+            counts = df["predicted_label"].value_counts().to_dict()
+            print(json.dumps({"status": "ok", "mode": "classify", "counts": counts}))
+            return 0
+
+        elif mode == "train":
+            model_out = train_activity_model(
+                dlc_csv_paths=list(CONFIG["dlc_csvs"]),
+                label_csv_paths=list(CONFIG["label_csvs"]),
+                output_model_path=str(CONFIG["out_model"]),
+                fps=int(CONFIG.get("fps", FPS)),
+            )
+            print(json.dumps({"status": "ok", "mode": "train", "model": model_out}))
+            return 0
+
+        else:
+            print(json.dumps({"status": "error", "message": f"Unknown mode '{mode}'"}))
+            return 2
+
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e)}))
-        return 1
-
-
-def _cmd_classify(args: argparse.Namespace) -> int:
-    try:
-        df = classify_bear_activity(
-            input_path=args.input,
-            output_dir=args.out,
-            use_mock=args.mock,
-            model_path=args.model,
-            fps=args.fps
-        )
-        # Print brief summary
-        counts = df["predicted_label"].value_counts().to_dict()
-        print(json.dumps({"status": "ok", "counts": counts}))
-        return 0
-    except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e)}))
-        return 1
-
-
-def _cmd_train(args: argparse.Namespace) -> int:
-    try:
-        path = train_activity_model(
-            dlc_csv_paths=args.dlc_csvs,
-            label_csv_paths=args.label_csvs,
-            output_model_path=args.out_model,
-            fps=args.fps
-        )
-        print(json.dumps({"status": "ok", "model": path}))
-        return 0
-    except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e)}))
+        # Provide clear guidance if sklearn/joblib missing for ML paths
+        msg = str(e)
+        if "scikit-learn" in msg or "joblib" in msg:
+            msg += " Hint: install scikit-learn and joblib, or set use_mock=True and/or rely on heuristic classification."
+        print(json.dumps({"status": "error", "message": msg}))
         return 1
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    if args.command == "estimate":
-        sys.exit(_cmd_estimate(args))
-    elif args.command == "classify":
-        sys.exit(_cmd_classify(args))
-    elif args.command == "train":
-        sys.exit(_cmd_train(args))
-    else:
-        print(json.dumps({"status": "error", "message": "Unknown command"}))
-        sys.exit(2)
+    sys.exit(main())
