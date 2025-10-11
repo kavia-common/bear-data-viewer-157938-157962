@@ -1,106 +1,38 @@
 #!/usr/bin/env python3
 """
-Bear Activity Classifier - Single-file module.
+Bear Activity Classifier - DeepLabCut required, heuristic-only.
 
-This module provides:
+This single-file module performs:
 1) DeepLabCut (DLC) inference for pose estimation on videos or image folders.
 2) Feature extraction from DLC CSV outputs (velocities, spans, spine angle).
-3) Activity classification into sleeping/standing/moving via:
-   - Heuristic fallback (no scikit-learn required), or
-   - ML model (RandomForest) with optional training.
-4) Execution controlled via a hardcoded configuration in main():
-   - mode: 'estimate' | 'classify' | 'train'
-   - paths: input_path, output_dir, optional model paths, training CSV lists
-   - options: use_mock (True/False), fps, DLC shuffle/trainingsetindex
+3) Rule-based heuristic classification into ['sleeping', 'standing', 'moving'].
 
-The code includes dependency checks and mock/stub fallbacks for DLC and sklearn.
-If DLC is not installed and use_mock=False, a clear error is raised. Set use_mock=True
-in the main() configuration to simulate DLC output for development/testing.
+Important:
+- No model training utilities. No scikit-learn/joblib usage.
+- No mock/stub pose fallback. DeepLabCut must be installed and configured.
+- You must provide a valid DLC config/project path in CONFIG.
 
-How to use (no CLI args):
-- Open this file and edit the CONFIG section inside main() to your needs.
+Usage:
+- Open this file and edit the CONFIG block inside main() to your environment.
 - Then run:
     python backend/bear_activity_classifier.py
+- If DeepLabCut is missing or the DLC config path is invalid, the script prints a clear error and exits.
 
-Notes:
-- DLC CSV format: MultiIndex columns [scorer, bodypart, coords], coords in [x, y, likelihood].
-- Label CSV format (for training): columns = ["frame","label"] where label in ["sleeping","standing","moving"].
-
-Environment & Dependencies:
-- Optional DLC integration tries to import 'deeplabcut' as dlc.
-- Uses numpy, pandas, opencv-python (cv2), pathlib, joblib (for model I/O), scikit-learn (optional).
-- If scikit-learn is unavailable, ML mode is disabled; fallback heuristic is used.
-
+DLC CSV format note:
+- DLC CSV typically uses a MultiIndex header [scorer, bodypart, coords], where coords in [x, y, likelihood].
 """
 
 from __future__ import annotations
 
 import sys
-import warnings
 import json
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# Minimal dependencies (numpy, pandas) are required.
 import numpy as np
 import pandas as pd
 
-# Optional dependencies
-try:
-    import cv2  # type: ignore
-except Exception:  # pragma: no cover
-    cv2 = None
-    warnings.warn("OpenCV (cv2) not found. Video frame count in mock may be limited. Install opencv-python for full support.")
-
-try:
-    import deeplabcut as dlc  # type: ignore
-    _DLC_AVAILABLE = True
-except Exception:
-    dlc = None
-    _DLC_AVAILABLE = False
-    warnings.warn("DeepLabCut not available. Enable use_mock=True in main() for simulated pose estimation output.")
-
-try:
-    from sklearn.ensemble import RandomForestClassifier  # type: ignore
-    from sklearn.model_selection import train_test_split  # noqa: F401
-    _SKLEARN_AVAILABLE = True
-except Exception:
-    RandomForestClassifier = None
-    _SKLEARN_AVAILABLE = False
-    warnings.warn("scikit-learn not available. Falling back to heuristic classifier.")
-
-try:
-    import joblib  # type: ignore
-    _JOBLIB_AVAILABLE = True
-except Exception:
-    joblib = None
-    _JOBLIB_AVAILABLE = False
-    warnings.warn("joblib not available. Model load/save will be disabled.")
-
-# ==================================
-# Configuration
-# ==================================
-
-# Optional paths to DLC project/model; not required in mock mode
-DLC_PROJECT_PATH: Optional[str] = None  # e.g., "/path/to/DLC/project/config.yaml"
-DLC_MODEL_PATH: Optional[str] = None    # Optional: path to specific DLC model
-
-# Default body parts commonly used (variable; can be inferred from CSV header)
-BODY_PARTS: List[str] = [
-    "nose", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder",
-    "spine", "left_hip", "right_hip"
-]
-
-# Default FPS (frames per second) used for velocity computation
-FPS: int = 30
-
-# Activity labels
-ACTIVITY_LABELS: List[str] = ["sleeping", "standing", "moving"]
-
-# ==================================
-# Utilities
-# ==================================
 
 def _ensure_dir(path: Path) -> None:
     """Ensure directory exists."""
@@ -117,81 +49,6 @@ def _list_images_in_dir(p: Path) -> List[Path]:
     return sorted([f for f in p.iterdir() if f.suffix.lower() in exts])
 
 
-def _read_video_frame_count(video_path: Path) -> int:
-    """Read video frame count using cv2 if available; otherwise returns 300 by default."""
-    if cv2 is None:
-        return 300
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return 300
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    if frame_count <= 0:
-        frame_count = 300
-    return frame_count
-
-
-def _generate_mock_dlc_dataframe(
-    n_frames: int,
-    body_parts: List[str],
-    image_size: Tuple[int, int] = (1280, 720),
-    seed: int = 42
-) -> pd.DataFrame:
-    """Generate a synthetic DLC-like DataFrame with MultiIndex columns."""
-    rng = np.random.default_rng(seed)
-
-    # Simulate a bear path: mixture of low/high movement segments
-    # Start near center
-    x = np.cumsum(rng.normal(loc=0.0, scale=2.0, size=n_frames)) + image_size[0] / 2
-    y = np.cumsum(rng.normal(loc=0.0, scale=1.5, size=n_frames)) + image_size[1] / 2
-
-    # Random velocity bursts
-    for i in range(0, n_frames, 150):
-        burst_len = min(rng.integers(20, 60), n_frames - i)
-        x[i:i+burst_len] += np.cumsum(rng.normal(0, 5.0, size=burst_len))
-        y[i:i+burst_len] += np.cumsum(rng.normal(0, 4.0, size=burst_len))
-
-    # Create columns multiindex: (scorer, bodypart, coord)
-    scorer = "mockDLC"
-    arrays = []
-    for bp in body_parts:
-        arrays.extend([(scorer, bp, "x"), (scorer, bp, "y"), (scorer, bp, "likelihood")])
-
-    tuples = arrays
-    index = pd.MultiIndex.from_tuples(tuples, names=["scorer", "bodypart", "coords"])
-
-    data = np.zeros((n_frames, len(body_parts) * 3), dtype=float)
-    for i, bp in enumerate(body_parts):
-        # Offset per body part to simulate realistic spread
-        dx = rng.normal(0, 20.0)
-        dy = rng.normal(0, 15.0)
-        noise_x = rng.normal(0, 3.0, size=n_frames)
-        noise_y = rng.normal(0, 3.0, size=n_frames)
-        base_x = x + dx + noise_x
-        base_y = y + dy + noise_y
-
-        # Likelihood fluctuates; most frames confident
-        like = np.clip(rng.normal(0.85, 0.1, size=n_frames), 0.0, 1.0)
-        # Add occasional low-likelihood segments
-        for j in range(0, n_frames, 200):
-            drop_len = min(rng.integers(5, 15), n_frames - j)
-            like[j:j+drop_len] *= rng.uniform(0.1, 0.4)
-
-        col_start = i * 3
-        data[:, col_start + 0] = base_x
-        data[:, col_start + 1] = base_y
-        data[:, col_start + 2] = like
-
-    df = pd.DataFrame(data, columns=index)
-    df.index.name = "frame"
-    return df
-
-
-def _save_dlc_csv(df: pd.DataFrame, path: Path) -> None:
-    """Save DLC-like DataFrame to CSV with header structure preserved."""
-    df.to_csv(path, index=True)
-
-
 def _infer_body_parts_from_csv(df: pd.DataFrame) -> List[str]:
     """Infer body parts from DLC CSV multiindex columns."""
     if isinstance(df.columns, pd.MultiIndex) and "bodypart" in df.columns.names:
@@ -202,27 +59,21 @@ def _infer_body_parts_from_csv(df: pd.DataFrame) -> List[str]:
         if isinstance(col, tuple) and len(col) >= 2:
             parts.append(col[1])
         else:
-            # flat columns: try pattern like "nose_x"
             if isinstance(col, str) and "_" in col:
                 parts.append(col.split("_")[0])
-    return sorted(set(parts) or BODY_PARTS)
+    return sorted(set(parts))
 
-
-# ==================================
-# Pose Estimation
-# ==================================
 
 # PUBLIC_INTERFACE
 def run_pose_estimation(
     input_path: str,
     output_dir: str,
-    use_mock: bool = False,
+    dlc_config_path: str,
     shuffle: int = 1,
-    trainingsetindex: int = 0,
-    dlc_project_path: Optional[str] = None,
-    dlc_model_path: Optional[str] = None
+    trainingsetindex: int = 0
 ) -> str:
-    """Run DeepLabCut pose estimation or mock generation.
+    """
+    Run DeepLabCut pose estimation on a video file or directory of images.
 
     Parameters
     ----------
@@ -230,8 +81,8 @@ def run_pose_estimation(
         Path to a video file or a directory of images.
     output_dir : str
         Directory to store DLC output CSV file(s).
-    use_mock : bool, optional
-        If True, generate a synthetic DLC-like CSV output for demonstration/testing.
+    dlc_config_path : str
+        Path to the DeepLabCut project/config YAML.
     shuffle : int, optional
         DLC shuffle parameter.
     trainingsetindex : int, optional
@@ -240,21 +91,26 @@ def run_pose_estimation(
     Returns
     -------
     str
-        Path to the resulting DLC CSV file.
+        Path to the resulting DLC CSV file (copied into output_dir).
 
     Raises
     ------
     RuntimeError
-        If DLC is not available and use_mock is False.
+        If DeepLabCut is not importable.
     FileNotFoundError
-        If input_path does not exist.
-
-    Notes
-    -----
-    dlc_project_path/dlc_model_path are optional. If not provided and DLC is enabled,
-    the function will rely on DLC environment defaults. If DLC is unavailable or
-    use_mock=True, a synthetic CSV will be generated.
+        If input_path or dlc_config_path do not exist.
+    ValueError
+        If input_path is neither a video nor a directory with images.
     """
+    # Import DLC strictly here to raise clear error early in pipeline.
+    try:
+        import deeplabcut as dlc  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "DeepLabCut is required but not installed. Please install 'deeplabcut' "
+            "and ensure it is importable in this environment."
+        ) from e
+
     input_p = Path(input_path)
     out_dir = Path(output_dir)
     _ensure_dir(out_dir)
@@ -262,97 +118,74 @@ def run_pose_estimation(
     if not input_p.exists():
         raise FileNotFoundError(f"Input path not found: {input_p}")
 
-    # Determine mode: video or images
+    cfg_p = Path(dlc_config_path)
+    if not cfg_p.exists():
+        raise FileNotFoundError(f"DLC config/project path not found: {cfg_p}")
+
     is_video = _is_video_file(input_p)
     is_dir = input_p.is_dir()
 
-    if not use_mock and not _DLC_AVAILABLE:
-        raise RuntimeError(
-            "DeepLabCut is not available. Install 'deeplabcut' or use --mock to simulate outputs."
-        )
-
-    # DLC real inference
-    if not use_mock and _DLC_AVAILABLE:
-        # Validate DLC project/model if provided
-        config_path = dlc_project_path if dlc_project_path is not None else DLC_PROJECT_PATH
-        if config_path is None:
-            warnings.warn(
-                "DLC project path is not set. Using DLC defaults; ensure your environment is configured."
-            )
-        # dlc_model_path is kept for possible future advanced calls; standard DLC API may not need it explicitly.
-
-        # Prepare list of items for DLC
-        if is_video:
-            videos = [str(input_p)]
-            print(f"[DLC] Analyzing video: {videos[0]}")
+    if is_video:
+        videos = [str(input_p)]
+        print(f"[DLC] Analyzing video: {videos[0]}")
+        try:
             dlc.analyze_videos(
-                config_path,
+                str(cfg_p),
                 videos,
                 videotype=input_p.suffix,
                 shuffle=shuffle,
                 trainingsetindex=trainingsetindex,
                 save_as_csv=True
             )
-            # DLC typically writes alongside the video; locate CSV
-            # We'll try to find the most recent CSV in same dir
-            candidate_dir = input_p.parent
-            csvs = sorted(candidate_dir.glob("*filtered*.csv")) + sorted(candidate_dir.glob("*csv"))
-            if not csvs:
-                raise RuntimeError("No DLC CSV output found after analyze_videos.")
-            # Copy the latest CSV to output_dir
-            csv_path = csvs[-1]
-            final_csv = out_dir / f"{input_p.stem}_DLC_output.csv"
-            pd.read_csv(csv_path, header=[0, 1, 2], index_col=0).to_csv(final_csv)
-            print(f"[DLC] Saved CSV to {final_csv}")
-            return str(final_csv)
+        except Exception as e:
+            raise RuntimeError(f"DeepLabCut analyze_videos failed: {e}") from e
 
-        elif is_dir:
-            images = _list_images_in_dir(input_p)
-            if not images:
-                raise RuntimeError(f"No images found in directory: {input_p}")
-            print(f"[DLC] Analyzing time-lapse images in: {input_p}")
+        candidate_dir = input_p.parent
+        csvs = sorted(candidate_dir.glob("*filtered*.csv")) + sorted(candidate_dir.glob("*.csv"))
+        if not csvs:
+            raise RuntimeError("No DLC CSV output found after analyze_videos.")
+        csv_path = csvs[-1]
+        final_csv = out_dir / f"{input_p.stem}_DLC_output.csv"
+        # Ensure we read with proper header; if it fails, fallback to single header
+        try:
+            pd.read_csv(csv_path, header=[0, 1, 2], index_col=0).to_csv(final_csv)
+        except Exception:
+            warnings.warn("CSV did not have a 3-level header; saving as flat header CSV.")
+            pd.read_csv(csv_path, index_col=0).to_csv(final_csv)
+        print(f"[DLC] Saved CSV to {final_csv}")
+        return str(final_csv)
+
+    if is_dir:
+        images = _list_images_in_dir(input_p)
+        if not images:
+            raise ValueError(f"No images found in directory: {input_p}")
+        print(f"[DLC] Analyzing time-lapse images in: {input_p}")
+        try:
             dlc.analyze_time_lapse_images(
-                config_path,
+                str(cfg_p),
                 str(input_p),
                 shuffle=shuffle,
                 trainingsetindex=trainingsetindex,
                 save_as_csv=True
             )
-            csvs = sorted(input_p.glob("*filtered*.csv")) + sorted(input_p.glob("*csv"))
-            if not csvs:
-                raise RuntimeError("No DLC CSV output found after analyze_time_lapse_images.")
-            csv_path = csvs[-1]
-            final_csv = out_dir / f"{input_p.name}_DLC_output.csv"
+        except Exception as e:
+            raise RuntimeError(f"DeepLabCut analyze_time_lapse_images failed: {e}") from e
+
+        csvs = sorted(input_p.glob("*filtered*.csv")) + sorted(input_p.glob("*.csv"))
+        if not csvs:
+            raise RuntimeError("No DLC CSV output found after analyze_time_lapse_images.")
+        csv_path = csvs[-1]
+        final_csv = out_dir / f"{input_p.name}_DLC_output.csv"
+        try:
             pd.read_csv(csv_path, header=[0, 1, 2], index_col=0).to_csv(final_csv)
-            print(f"[DLC] Saved CSV to {final_csv}")
-            return str(final_csv)
+        except Exception:
+            warnings.warn("CSV did not have a 3-level header; saving as flat header CSV.")
+            pd.read_csv(csv_path, index_col=0).to_csv(final_csv)
+        print(f"[DLC] Saved CSV to {final_csv}")
+        return str(final_csv)
 
-        else:
-            raise RuntimeError("Input path must be a video file or a directory of images.")
+    raise ValueError("Input path must be a video file or a directory of images.")
 
-    # Mock mode
-    # Decide frame count
-    if is_video:
-        n_frames = _read_video_frame_count(input_p)
-    elif is_dir:
-        n_frames = len(_list_images_in_dir(input_p))
-        if n_frames == 0:
-            # Try a default if no image; still allow demonstration
-            n_frames = 300
-    else:
-        raise RuntimeError("Input path must be a video file or a directory of images.")
-
-    print(f"[MOCK] Generating synthetic DLC CSV for {n_frames} frames...")
-    df = _generate_mock_dlc_dataframe(n_frames, BODY_PARTS)
-    final_csv = out_dir / (f"{input_p.stem}_mock_DLC.csv" if is_video else f"{input_p.name}_mock_DLC.csv")
-    _save_dlc_csv(df, final_csv)
-    print(f"[MOCK] Saved synthetic CSV to {final_csv}")
-    return str(final_csv)
-
-
-# ==================================
-# Feature Extraction
-# ==================================
 
 def _rolling_median(series: pd.Series, window: int = 5) -> pd.Series:
     return series.rolling(window=window, min_periods=1, center=True).median()
@@ -364,7 +197,6 @@ def _compute_spine_angle(
     likelihood_threshold: float
 ) -> pd.Series:
     """Compute spine angle (degrees) using vector between shoulders and hips."""
-    # Attempt to use left/right shoulders and hips; fallback to any shoulder/hip-like parts
     def _first_available(candidates: List[str]) -> Optional[str]:
         for c in candidates:
             if c in parts:
@@ -377,28 +209,24 @@ def _compute_spine_angle(
     rh = _first_available(["right_hip", "r_hip", "RHip", "HipR"])
 
     def _get_xy_like(bp: str) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        # MultiIndex access: (:, bp, x/y/likelihood)
         if isinstance(df.columns, pd.MultiIndex):
             x = df.xs((bp, "x"), level=("bodypart", "coords"), axis=1, drop_level=False).iloc[:, 0]
             y = df.xs((bp, "y"), level=("bodypart", "coords"), axis=1, drop_level=False).iloc[:, 0]
             l = df.xs((bp, "likelihood"), level=("bodypart", "coords"), axis=1, drop_level=False).iloc[:, 0]
             return x, y, l
-        else:
-            # flat fallback: bp_x, bp_y, bp_likelihood
-            x = df.get(f"{bp}_x", pd.Series(np.nan, index=df.index))
-            y = df.get(f"{bp}_y", pd.Series(np.nan, index=df.index))
-            l = df.get(f"{bp}_likelihood", pd.Series(np.nan, index=df.index))
-            return x, y, l
+        # flat columns: bp_x, bp_y, bp_likelihood
+        x = df.get(f"{bp}_x", pd.Series(np.nan, index=df.index))
+        y = df.get(f"{bp}_y", pd.Series(np.nan, index=df.index))
+        l = df.get(f"{bp}_likelihood", pd.Series(np.nan, index=df.index))
+        return x, y, l
 
-    def _mean_point(bps: List[str]) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    def _mean_point(bps: List[Optional[str]]) -> Tuple[pd.Series, pd.Series, pd.Series]:
         xs, ys, ls = [], [], []
         for bp in bps:
             if bp is None:
                 continue
             x, y, l = _get_xy_like(bp)
-            xs.append(x)
-            ys.append(y)
-            ls.append(l)
+            xs.append(x); ys.append(y); ls.append(l)
         if not xs:
             nan_series = pd.Series(np.nan, index=df.index)
             return nan_series, nan_series, nan_series
@@ -406,7 +234,6 @@ def _compute_spine_angle(
         ys = pd.concat(ys, axis=1)
         ls = pd.concat(ls, axis=1)
         mask = ls >= likelihood_threshold
-        # Avoid all-false rows
         xs_masked = xs.where(mask)
         ys_masked = ys.where(mask)
         x_mean = xs_masked.mean(axis=1)
@@ -417,63 +244,46 @@ def _compute_spine_angle(
     shoulder_x, shoulder_y, _ = _mean_point([ls, rs])
     hip_x, hip_y, _ = _mean_point([lh, rh])
 
-    # Vector shoulder->hip
     dx = hip_x - shoulder_x
     dy = hip_y - shoulder_y
-    # Angle relative to vertical: compute angle of vector with respect to y-axis
-    # angle = arctan2(dx, dy) in degrees; near 0 means vertical, near 90 means horizontal
     angle_rad = np.arctan2(dx, dy)
     angle_deg = np.degrees(angle_rad)
-    return angle_deg.abs()  # absolute distance from vertical direction
+    return angle_deg.abs()
 
 
 # PUBLIC_INTERFACE
 def extract_features_from_dlc_csv(
     csv_path: str,
-    fps: int = FPS,
+    fps: int = 30,
     likelihood_threshold: float = 0.6
 ) -> pd.DataFrame:
-    """Extract per-frame features from a DLC CSV file.
+    """
+    Extract per-frame features from a DLC CSV file.
 
-    Features include:
+    Features:
     - mean_likelihood: average confidence across parts.
     - com_x, com_y: center of mass of confident keypoints.
     - com_velocity: magnitude of COM velocity (pixels/sec).
-    - vertical_span, horizontal_span: bbox span across confident keypoints.
+    - vertical_span, horizontal_span: bbox spans of confident keypoints.
     - spine_angle_from_vertical: abs angle (deg) between spine axis and vertical.
 
-    Parameters
-    ----------
-    csv_path : str
-        Path to DLC CSV file (multiindex columns recommended).
-    fps : int, optional
-        Frames per second used to compute velocities.
-    likelihood_threshold : float, optional
-        Minimum likelihood for a keypoint to be considered in aggregations.
-
-    Returns
-    -------
-    pandas.DataFrame
-        DataFrame indexed by frame with computed features.
+    Returns a DataFrame indexed by frame with these features.
     """
-    df = pd.read_csv(csv_path, header=[0, 1, 2], index_col=0)
-    # If not multiindex header, try fallback
-    if not isinstance(df.columns, pd.MultiIndex) or df.columns.nlevels < 3:
-        # Fallback to single-level columns
+    # Try reading as multiindex; fallback to flat header
+    try:
+        df = pd.read_csv(csv_path, header=[0, 1, 2], index_col=0)
+    except Exception:
         df = pd.read_csv(csv_path, index_col=0)
 
     parts = _infer_body_parts_from_csv(df)
 
-    # Build arrays of x,y,likelihood for all parts
     xs, ys, ls = [], [], []
     for bp in parts:
         if isinstance(df.columns, pd.MultiIndex):
             x = df.xs((bp, "x"), level=("bodypart", "coords"), axis=1, drop_level=False)
             y = df.xs((bp, "y"), level=("bodypart", "coords"), axis=1, drop_level=False)
             l = df.xs((bp, "likelihood"), level=("bodypart", "coords"), axis=1, drop_level=False)
-            xs.append(x.iloc[:, 0])
-            ys.append(y.iloc[:, 0])
-            ls.append(l.iloc[:, 0])
+            xs.append(x.iloc[:, 0]); ys.append(y.iloc[:, 0]); ls.append(l.iloc[:, 0])
         else:
             xs.append(df.get(f"{bp}_x", pd.Series(np.nan, index=df.index)))
             ys.append(df.get(f"{bp}_y", pd.Series(np.nan, index=df.index)))
@@ -486,24 +296,18 @@ def extract_features_from_dlc_csv(
     Y.columns = parts[:Y.shape[1]]
     L.columns = parts[:L.shape[1]]
 
-    # Mean likelihood
     mean_likelihood = L.mean(axis=1).fillna(0.0)
-
-    # Confident masks
     conf_mask = L >= likelihood_threshold
-
-    # Center of mass over confident points
     Xc = X.where(conf_mask)
     Yc = Y.where(conf_mask)
+
     com_x = Xc.mean(axis=1)
     com_y = Yc.mean(axis=1)
 
-    # Velocity of COM
     dcom_x = com_x.diff().fillna(0.0)
     dcom_y = com_y.diff().fillna(0.0)
     com_velocity = np.sqrt(dcom_x.pow(2) + dcom_y.pow(2)) * float(fps)
 
-    # Posture spans (bbox across confident keypoints)
     x_min = Xc.min(axis=1)
     x_max = Xc.max(axis=1)
     y_min = Yc.min(axis=1)
@@ -511,48 +315,29 @@ def extract_features_from_dlc_csv(
     horizontal_span = (x_max - x_min).fillna(0.0)
     vertical_span = (y_max - y_min).fillna(0.0)
 
-    # Spine angle from vertical
     spine_angle_from_vertical = _compute_spine_angle(df, parts, likelihood_threshold)
 
-    # Smooth selected signals
-    com_x_s = _rolling_median(com_x, 5)
-    com_y_s = _rolling_median(com_y, 5)
-    com_velocity_s = _rolling_median(com_velocity, 5)
-    vertical_span_s = _rolling_median(vertical_span, 5)
-    horizontal_span_s = _rolling_median(horizontal_span, 5)
-    spine_angle_s = _rolling_median(spine_angle_from_vertical, 5)
-    mean_like_s = _rolling_median(mean_likelihood, 5)
-
     features = pd.DataFrame({
-        "mean_likelihood": mean_like_s,
-        "com_x": com_x_s,
-        "com_y": com_y_s,
-        "com_velocity": com_velocity_s,
-        "vertical_span": vertical_span_s,
-        "horizontal_span": horizontal_span_s,
-        "spine_angle_from_vertical": spine_angle_s
+        "mean_likelihood": _rolling_median(mean_likelihood, 5),
+        "com_x": _rolling_median(com_x, 5),
+        "com_y": _rolling_median(com_y, 5),
+        "com_velocity": _rolling_median(com_velocity, 5),
+        "vertical_span": _rolling_median(vertical_span, 5),
+        "horizontal_span": _rolling_median(horizontal_span, 5),
+        "spine_angle_from_vertical": _rolling_median(spine_angle_from_vertical, 5),
     })
     features.index.name = "frame"
-    # Fill remaining NaNs with nearest reasonable values
     features = features.fillna(method="ffill").fillna(method="bfill").fillna(0.0)
     return features
 
 
-# ==================================
-# Classification
-# ==================================
-
 def _adaptive_thresholds(df: pd.DataFrame) -> Tuple[float, float, float]:
     """Compute adaptive thresholds for velocity and spans using quantiles."""
-    # Use quantiles robust to outliers
     v = df["com_velocity"].clip(lower=0)
     vert = df["vertical_span"].clip(lower=0)
-    # Low and moving thresholds for velocity
-    low_vel = float(np.quantile(v, 0.2))  # under this ~ sleeping/standing
-    move_vel = float(np.quantile(v, 0.7))  # above this ~ moving
-    # Vertical span boundary between sleeping and standing
+    low_vel = float(np.quantile(v, 0.2))
+    move_vel = float(np.quantile(v, 0.7))
     vert_split = float(np.quantile(vert, 0.5))
-    # Ensure ordering
     if move_vel <= low_vel:
         move_vel = low_vel * 1.5 + 1.0
     return low_vel, move_vel, vert_split
@@ -560,7 +345,8 @@ def _adaptive_thresholds(df: pd.DataFrame) -> Tuple[float, float, float]:
 
 # PUBLIC_INTERFACE
 def classify_features_heuristic(df_features: pd.DataFrame) -> List[str]:
-    """Heuristic classifier mapping features to activity labels.
+    """
+    Heuristic classifier mapping features to activity labels.
 
     Rules:
     - moving: com_velocity >= moving_threshold
@@ -585,80 +371,33 @@ def classify_features_heuristic(df_features: pd.DataFrame) -> List[str]:
             labels.append("moving")
             continue
 
-        # Low velocity region
         if like >= 0.5 and v < low_vel:
-            # spine near vertical (small angle) suggests standing; very small vertical span suggests sleeping
             if vert <= 0.5 * vert_split:
                 labels.append("sleeping")
             else:
-                # Spine near vertical (<= 25 deg) -> standing; else sleeping/standing tie-breaker by span
                 if spine <= 25.0:
                     labels.append("standing")
                 else:
                     labels.append("sleeping")
         else:
-            # Intermediate region: prefer standing if spine closer to vertical and span is moderate
             if spine <= 25.0 and vert >= 0.5 * vert_split:
                 labels.append("standing")
             else:
-                # Default to moving if velocity moderate
                 labels.append("moving" if v >= 0.5 * move_vel else "standing")
     return labels
 
 
 # PUBLIC_INTERFACE
-def train_classifier(
-    features_df: pd.DataFrame,
-    labels_series: pd.Series,
-    random_state: int = 42
-):
-    """Train a RandomForest classifier on features.
-
-    Returns a trained model. Requires scikit-learn to be installed.
-    """
-    if not _SKLEARN_AVAILABLE or RandomForestClassifier is None:
-        raise RuntimeError("scikit-learn is not available. Cannot train ML classifier.")
-    model = RandomForestClassifier(
-        n_estimators=200,
-        random_state=random_state,
-        class_weight="balanced"
-    )
-    # Ensure alignment
-    X = features_df[
-        ["mean_likelihood", "com_velocity", "vertical_span", "horizontal_span", "spine_angle_from_vertical"]
-    ].copy()
-    y = labels_series.astype(str)
-    model.fit(X, y)
-    return model
-
-
-# PUBLIC_INTERFACE
-def predict_classifier(model, features_df: pd.DataFrame) -> List[str]:
-    """Predict labels with a trained classifier."""
-    X = features_df[
-        ["mean_likelihood", "com_velocity", "vertical_span", "horizontal_span", "spine_angle_from_vertical"]
-    ].copy()
-    preds = model.predict(X)
-    return list(map(str, preds))
-
-
-# ==================================
-# End-to-end pipeline
-# ==================================
-
-# PUBLIC_INTERFACE
 def classify_bear_activity(
     input_path: str,
     output_dir: str,
-    use_mock: bool = False,
-    model_path: Optional[str] = None,
-    fps: int = FPS,
-    dlc_project_path: Optional[str] = None,
-    dlc_model_path: Optional[str] = None,
+    dlc_config_path: str,
+    fps: int = 30,
     shuffle: int = 1,
     trainingsetindex: int = 0
 ) -> pd.DataFrame:
-    """Run end-to-end: pose estimation -> features -> classification.
+    """
+    End-to-end: DLC pose estimation -> feature extraction -> heuristic classification.
 
     Parameters
     ----------
@@ -666,22 +405,19 @@ def classify_bear_activity(
         Path to a video file or directory of images.
     output_dir : str
         Directory to store intermediate CSVs and predictions.
-    use_mock : bool, optional
-        Use mock DLC output instead of real DLC.
-    model_path : Optional[str], optional
-        Path to a joblib model for ML classification; if missing/unloadable, fallback to heuristic.
+    dlc_config_path : str
+        Path to DeepLabCut config/project YAML.
     fps : int, optional
         Frames per second for feature computations.
+    shuffle : int, optional
+        DLC shuffle parameter.
+    trainingsetindex : int, optional
+        DLC trainingsetindex parameter.
 
     Returns
     -------
     pandas.DataFrame
         DataFrame with columns: frame, timestamp, predicted_label.
-
-    Notes
-    -----
-    dlc_project_path/dlc_model_path parameters are forwarded to pose estimation.
-    If DLC is not available or use_mock=True, a synthetic DLC CSV will be used.
     """
     out_dir = Path(output_dir)
     _ensure_dir(out_dir)
@@ -689,34 +425,15 @@ def classify_bear_activity(
     dlc_csv = run_pose_estimation(
         input_path=input_path,
         output_dir=output_dir,
-        use_mock=use_mock,
+        dlc_config_path=dlc_config_path,
         shuffle=shuffle,
-        trainingsetindex=trainingsetindex,
-        dlc_project_path=dlc_project_path,
-        dlc_model_path=dlc_model_path
+        trainingsetindex=trainingsetindex
     )
     features = extract_features_from_dlc_csv(dlc_csv, fps=fps)
 
-    # timestamp from frame index and FPS
     frames = features.index.values
     timestamps = frames / float(fps)
-
-    # Try ML classifier if provided
-    labels: List[str]
-    used_ml = False
-    if model_path and _JOBLIB_AVAILABLE:
-        try:
-            model = joblib.load(model_path)  # type: ignore
-            labels = predict_classifier(model, features)
-            used_ml = True
-            print(f"[CLASSIFY] Used ML model: {model_path}")
-        except Exception as e:
-            warnings.warn(f"Failed to load/apply model '{model_path}': {e}. Falling back to heuristic.")
-            labels = classify_features_heuristic(features)
-    else:
-        if model_path and not _JOBLIB_AVAILABLE:
-            warnings.warn("joblib not available; cannot load model. Using heuristic instead.")
-        labels = classify_features_heuristic(features)
+    labels = classify_features_heuristic(features)
 
     result = pd.DataFrame({
         "frame": frames,
@@ -725,80 +442,9 @@ def classify_bear_activity(
     })
     pred_path = out_dir / "predictions.csv"
     result.to_csv(pred_path, index=False)
-    print(f"[CLASSIFY] Saved predictions to {pred_path} ({'ML' if used_ml else 'Heuristic'})")
+    print(f"[CLASSIFY] Saved predictions to {pred_path} (Heuristic)")
     return result
 
-
-# ==================================
-# Training utility
-# ==================================
-
-# PUBLIC_INTERFACE
-def train_activity_model(
-    dlc_csv_paths: List[str],
-    label_csv_paths: List[str],
-    output_model_path: str,
-    fps: int = FPS
-) -> str:
-    """Train a RandomForest model from DLC CSVs and per-frame labels CSVs.
-
-    Parameters
-    ----------
-    dlc_csv_paths : List[str]
-        List of DLC CSV paths.
-    label_csv_paths : List[str]
-        List of label CSV paths matching dlc_csv_paths (columns: frame,label).
-    output_model_path : str
-        Where to save the trained model (joblib).
-    fps : int, optional
-        Frames per second to use for feature extraction.
-
-    Returns
-    -------
-    str
-        Path to the saved model.
-
-    Raises
-    ------
-    RuntimeError
-        If scikit-learn or joblib are not available.
-    """
-    if not _SKLEARN_AVAILABLE or RandomForestClassifier is None:
-        raise RuntimeError("scikit-learn is not available. Cannot train ML classifier.")
-    if not _JOBLIB_AVAILABLE:
-        raise RuntimeError("joblib is not available. Cannot save model.")
-
-    if len(dlc_csv_paths) != len(label_csv_paths):
-        raise ValueError("dlc_csv_paths and label_csv_paths must have the same length.")
-
-    all_features = []
-    all_labels = []
-    for dlc_csv, lab_csv in zip(dlc_csv_paths, label_csv_paths):
-        feats = extract_features_from_dlc_csv(dlc_csv, fps=fps)
-        labels_df = pd.read_csv(lab_csv)
-        if not {"frame", "label"}.issubset(labels_df.columns):
-            raise ValueError(f"Label CSV must contain 'frame' and 'label' columns: {lab_csv}")
-        labels_df = labels_df.set_index("frame").loc[feats.index]
-        y = labels_df["label"].astype(str)
-        # Keep only aligned rows
-        mask = y.notna()
-        all_features.append(feats[mask])
-        all_labels.append(y[mask])
-
-    X = pd.concat(all_features, axis=0)
-    y = pd.concat(all_labels, axis=0)
-
-    model = train_classifier(X, y)
-    out_path = Path(output_model_path)
-    _ensure_dir(out_path.parent)
-    joblib.dump(model, out_path)  # type: ignore
-    print(f"[TRAIN] Saved model to {out_path} (n={len(y)} samples)")
-    return str(out_path)
-
-
-# ==================================
-# Main (hardcoded configuration)
-# ==================================
 
 # PUBLIC_INTERFACE
 def main() -> int:
@@ -807,75 +453,80 @@ def main() -> int:
 
     Edit the CONFIG block below to control behavior.
 
-    CONFIG keys:
-    - mode: 'estimate' | 'classify' | 'train'
-    - input_path: path to video file or image directory (for estimate/classify)
-    - output_dir: directory to write outputs (CSV, predictions, model)
-    - use_mock: True to simulate DLC output
-    - fps: frames per second for features/velocity
-    - model_path: path to trained model (.joblib) for classification (optional)
-    - dlc_project_path: path to DLC config/project (optional)
-    - dlc_model_path: path to specific DLC model (optional, not always needed)
+    Required CONFIG keys:
+    - mode: 'estimate' | 'classify'
+    - input_path: path to video file or image directory
+    - output_dir: directory to write outputs (CSV, predictions)
+    - dlc_config_path: path to DLC project/config YAML (REQUIRED)
+
+    Optional:
+    - fps: frames per second for features/velocity (default 30)
     - shuffle: DLC shuffle parameter (int)
     - trainingsetindex: DLC trainingsetindex parameter (int)
-    - dlc_csvs: list of DLC CSV paths for training
-    - label_csvs: list of label CSV paths for training
-    - out_model: model output path for training
     """
     # ======== CONFIG: EDIT THESE VALUES ========
     CONFIG = {
-        # Choose one of: 'estimate', 'classify', 'train'
-        "mode": "classify",
+        "mode": "classify",                        # 'estimate' or 'classify'
+        "input_path": "sample_data/video.mp4",     # path to video or image dir
+        "output_dir": "outputs",                   # directory to write CSVs/predictions
 
-        # Common paths
-        "input_path": "sample_data/video.mp4",    # path to video or image dir
-        "output_dir": "outputs",                 # directory to write CSVs/predictions
+        # DLC: REQUIRED - set to your DLC project/config YAML
+        "dlc_config_path": "/absolute/path/to/your/DLC/project/config.yaml",
 
-        # DLC options
-        "use_mock": True,                        # set True to bypass DLC and use synthetic CSV
-        "dlc_project_path": None,                # e.g., "/path/to/DLC/project/config.yaml"
-        "dlc_model_path": None,                  # optional; DLC often doesn't require explicit model path
+        # Optional processing parameters
+        "fps": 30,
         "shuffle": 1,
         "trainingsetindex": 0,
-
-        # Feature options
-        "fps": 30,
-
-        # Classification (ML) options
-        "model_path": None,                      # e.g., "outputs/model.joblib" (if available)
-
-        # Training options
-        "dlc_csvs": ["train/dlc1.csv", "train/dlc2.csv"],
-        "label_csvs": ["train/lab1.csv", "train/lab2.csv"],
-        "out_model": "outputs/model.joblib",
     }
     # ======== END CONFIG ========
 
-    mode = CONFIG.get("mode", "classify")
+    mode = str(CONFIG.get("mode", "classify")).strip().lower()
+    input_path = str(CONFIG.get("input_path", "")).strip()
+    output_dir = str(CONFIG.get("output_dir", "")).strip()
+    dlc_config_path = str(CONFIG.get("dlc_config_path", "")).strip()
+
+    # Validate DLC import early to give a clear message
+    try:
+        import deeplabcut as _  # noqa: F401
+    except Exception:
+        print(json.dumps({
+            "status": "error",
+            "message": "DeepLabCut is required but not installed. Please install 'deeplabcut' and retry."
+        }))
+        return 1
+
+    # Validate paths
+    if not input_path:
+        print(json.dumps({"status": "error", "message": "CONFIG['input_path'] is required."}))
+        return 1
+    if not output_dir:
+        print(json.dumps({"status": "error", "message": "CONFIG['output_dir'] is required."}))
+        return 1
+    if not dlc_config_path:
+        print(json.dumps({"status": "error", "message": "CONFIG['dlc_config_path'] is required and must point to a valid DLC config YAML."}))
+        return 1
+    if not Path(dlc_config_path).exists():
+        print(json.dumps({"status": "error", "message": f"DLC config path not found: {dlc_config_path}"}))
+        return 1
 
     try:
         if mode == "estimate":
             csv_path = run_pose_estimation(
-                input_path=str(CONFIG["input_path"]),
-                output_dir=str(CONFIG["output_dir"]),
-                use_mock=bool(CONFIG.get("use_mock", False)),
+                input_path=input_path,
+                output_dir=output_dir,
+                dlc_config_path=dlc_config_path,
                 shuffle=int(CONFIG.get("shuffle", 1)),
                 trainingsetindex=int(CONFIG.get("trainingsetindex", 0)),
-                dlc_project_path=CONFIG.get("dlc_project_path"),
-                dlc_model_path=CONFIG.get("dlc_model_path"),
             )
             print(json.dumps({"status": "ok", "mode": "estimate", "csv": csv_path}))
             return 0
 
-        elif mode == "classify":
+        if mode == "classify":
             df = classify_bear_activity(
-                input_path=str(CONFIG["input_path"]),
-                output_dir=str(CONFIG["output_dir"]),
-                use_mock=bool(CONFIG.get("use_mock", False)),
-                model_path=CONFIG.get("model_path"),
-                fps=int(CONFIG.get("fps", FPS)),
-                dlc_project_path=CONFIG.get("dlc_project_path"),
-                dlc_model_path=CONFIG.get("dlc_model_path"),
+                input_path=input_path,
+                output_dir=output_dir,
+                dlc_config_path=dlc_config_path,
+                fps=int(CONFIG.get("fps", 30)),
                 shuffle=int(CONFIG.get("shuffle", 1)),
                 trainingsetindex=int(CONFIG.get("trainingsetindex", 0)),
             )
@@ -883,26 +534,11 @@ def main() -> int:
             print(json.dumps({"status": "ok", "mode": "classify", "counts": counts}))
             return 0
 
-        elif mode == "train":
-            model_out = train_activity_model(
-                dlc_csv_paths=list(CONFIG["dlc_csvs"]),
-                label_csv_paths=list(CONFIG["label_csvs"]),
-                output_model_path=str(CONFIG["out_model"]),
-                fps=int(CONFIG.get("fps", FPS)),
-            )
-            print(json.dumps({"status": "ok", "mode": "train", "model": model_out}))
-            return 0
-
-        else:
-            print(json.dumps({"status": "error", "message": f"Unknown mode '{mode}'"}))
-            return 2
+        print(json.dumps({"status": "error", "message": f"Unknown mode '{mode}'"}))
+        return 2
 
     except Exception as e:
-        # Provide clear guidance if sklearn/joblib missing for ML paths
-        msg = str(e)
-        if "scikit-learn" in msg or "joblib" in msg:
-            msg += " Hint: install scikit-learn and joblib, or set use_mock=True and/or rely on heuristic classification."
-        print(json.dumps({"status": "error", "message": msg}))
+        print(json.dumps({"status": "error", "message": str(e)}))
         return 1
 
 
