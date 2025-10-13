@@ -3,16 +3,24 @@
 Simple S3 upload test script.
 
 This script uploads a local image file named 'bala_test.png' (expected to be in the same directory)
-to a hardcoded S3 bucket and key using boto3 with hardcoded credentials and region.
+to a specified S3 bucket and key using boto3 with credentials sourced from environment variables.
 
 Usage:
-  python test_s3_upload.py
+  - As a script: python test_s3_upload.py
+  - As a pytest test: will be skipped if AWS credentials are not present in env.
+
+Environment variables used:
+  - AWS_ACCESS_KEY_ID (required for running)
+  - AWS_SECRET_ACCESS_KEY (required for running)
+  - AWS_DEFAULT_REGION (optional; defaults to 'us-east-1' if not set)
+  - AWS_SESSION_TOKEN (optional; used if present)
+  - TEST_S3_BUCKET_NAME (optional; if set, used as bucket name)
+  - TEST_S3_OBJECT_KEY (optional; if set, used as object key)
 
 Notes:
-  - This is a test utility that uses hardcoded values for credentials and S3 details.
-  - It prints informative logs before and after the upload.
-  - It returns/prints the final S3 object URL (constructed from bucket, region, and key).
-  - Basic exceptions are handled and printed to stdout.
+  - No hardcoded secrets. Credentials are read from environment variables.
+  - Skips the pytest-based run if required credentials are missing.
+  - Prints informative logs and returns the final S3 object URL (constructed from bucket, region, and key).
 """
 
 import os
@@ -23,15 +31,22 @@ from typing import Optional
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+try:
+    import pytest  # optional dependency in test context
+except Exception:  # pragma: no cover - script mode may not have pytest
+    pytest = None  # type: ignore
+
 # =========================
-# Hardcoded configuration
+# Configuration (from env)
 # =========================
-# Replace these placeholder values with actual test credentials and details.
-AWS_ACCESS_KEY_ID = "YOUR_ACCESS_KEY_ID"
-AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
-AWS_REGION = "us-east-1"  # e.g., "us-east-1"
-S3_BUCKET_NAME = "your-bucket-name"
-S3_OBJECT_KEY = "test/bala_test.png"  # Destination key in the bucket
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")  # optional
+
+# Allow overriding bucket/key via env for flexibility in CI
+S3_BUCKET_NAME = os.getenv("TEST_S3_BUCKET_NAME", "your-bucket-name")
+S3_OBJECT_KEY = os.getenv("TEST_S3_OBJECT_KEY", "test/bala_test.png")
 
 # Local file expected to be present in the same folder as this script
 LOCAL_FILENAME = "bala_test.png"
@@ -56,9 +71,29 @@ def upload_test_image() -> Optional[str]:
 
     Returns:
         Optional[str]: Constructed S3 URL on success, or None on failure.
+
+    Behavior:
+        - Reads AWS credentials from environment variables.
+        - If credentials are missing and running under pytest, the test is skipped with a clear message.
+        - If run as a standalone script and credentials are missing, prints an error and returns None.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     local_path = os.path.join(script_dir, LOCAL_FILENAME)
+
+    missing = []
+    if not AWS_ACCESS_KEY_ID:
+        missing.append("AWS_ACCESS_KEY_ID")
+    if not AWS_SECRET_ACCESS_KEY:
+        missing.append("AWS_SECRET_ACCESS_KEY")
+
+    if missing:
+        msg = f"Missing required AWS environment variables: {', '.join(missing)}"
+        if pytest is not None:
+            pytest.skip(msg)
+            return None  # pragma: no cover (pytest.skip raises, but keep for safety)
+        else:
+            print(f"[SKIP] {msg}")
+            return None
 
     print("[INFO] Starting S3 upload test")
     print(f"[INFO] Local file expected at: {local_path}")
@@ -72,12 +107,17 @@ def upload_test_image() -> Optional[str]:
 
     try:
         print("[INFO] Creating S3 client...")
-        s3_client = boto3.client(
-            "s3",
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        )
+        # Build kwargs for boto3 client based on env
+        client_kwargs = {
+            "service_name": "s3",
+            "region_name": AWS_REGION,
+            "aws_access_key_id": AWS_ACCESS_KEY_ID,
+            "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+        }
+        if AWS_SESSION_TOKEN:
+            client_kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+
+        s3_client = boto3.client(**client_kwargs)
 
         print("[INFO] Uploading file to S3...")
         s3_client.upload_file(local_path, S3_BUCKET_NAME, S3_OBJECT_KEY)
@@ -107,6 +147,10 @@ def main() -> None:
         print(f"[RESULT] Uploaded file URL: {result}")
         sys.exit(0)
     else:
+        # Non-fatal if skipped due to missing env vars; return code 0 with message.
+        if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+            print("[RESULT] Skipped upload: missing AWS credentials in environment.")
+            sys.exit(0)
         print("[RESULT] Upload failed.")
         sys.exit(1)
 
