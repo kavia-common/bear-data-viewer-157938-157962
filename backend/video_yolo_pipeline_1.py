@@ -48,7 +48,17 @@ import csv
 import tempfile
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+
+# Try to import boto3 for S3 uploads; guard if missing
+try:
+    import boto3  # type: ignore
+    from botocore.exceptions import BotoCoreError, ClientError  # type: ignore
+    BOTO3_AVAILABLE = True
+except Exception as e:
+    print(f"[WARN] boto3 import failed (S3 upload disabled): {e}", file=sys.stderr)
+    boto3 = None  # type: ignore
+    BOTO3_AVAILABLE = False
 
 # Optional imports with graceful error messages
 try:
@@ -229,14 +239,148 @@ def _write_csv_header(out_path: Path):
     """Ensure CSV header exists; overwrite file to start fresh."""
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["frame_time_seconds", "label", "x1", "y1", "x2", "y2", "confidence"])
+        # Added 'pose' (blank for now) and 's3_image_link' for uploaded frame URL
+        writer.writerow(["frame_time_seconds", "label", "x1", "y1", "x2", "y2", "confidence", "pose", "s3_image_link"])
 
 
-def _append_detection(out_path: Path, time_s: float, label: str, x1: int, y1: int, x2: int, y2: int, conf: float):
-    """Append one detection row to the CSV."""
+def _append_detection(out_path: Path, time_s: float, label: str, x1: int, y1: int, x2: int, y2: int, conf: float, pose: str, s3_url: str):
+    """Append one detection row to the CSV, including pose and s3_image_link."""
     with out_path.open("a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([_round2(time_s), label, int(x1), int(y1), int(x2), int(y2), _round4(conf)])
+        writer.writerow([_round2(time_s), label, int(x1), int(y1), int(x2), int(y2), _round4(conf), pose, s3_url])
+
+
+def _get_boto3_s3_client():
+    """Create a boto3 S3 client using environment variables, or return None if unavailable/misconfigured."""
+    if not BOTO3_AVAILABLE:
+        return None
+    # Credentials/config via env
+    aws_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    aws_region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+    endpoint_url = os.environ.get("AWS_S3_ENDPOINT_URL")  # Optional
+
+    # If creds are missing, still try default chain; boto3 can pick up IAM or env
+    try:
+        session_kwargs = {}
+        if aws_region:
+            session_kwargs["region_name"] = aws_region
+        session = boto3.session.Session(**session_kwargs)  # type: ignore
+
+        client_kwargs = {}
+        if endpoint_url:
+            client_kwargs["endpoint_url"] = endpoint_url
+        if aws_access_key_id and aws_secret_access_key:
+            client_kwargs["aws_access_key_id"] = aws_access_key_id
+            client_kwargs["aws_secret_access_key"] = aws_secret_access_key
+
+        s3_client = session.client("s3", **client_kwargs)  # type: ignore
+        return s3_client
+    except Exception as e:
+        print(f"[WARN] Failed to create boto3 S3 client: {e}", file=sys.stderr)
+        return None
+
+
+def _guess_region_from_bucket(bucket: str) -> Optional[str]:
+    """Optionally query bucket region to build URL; non-fatal on failure."""
+    client = _get_boto3_s3_client()
+    if not client:
+        return None
+    try:
+        resp = client.get_bucket_location(Bucket=bucket)  # type: ignore
+        # For us-east-1, response can be None or 'us-east-1' depending on API
+        loc = resp.get("LocationConstraint")
+        return loc or "us-east-1"
+    except Exception:
+        return None
+
+
+def _build_http_url(bucket: str, key: str, region_hint: Optional[str] = None, endpoint_url: Optional[str] = None) -> str:
+    """
+    Build an HTTP URL to the S3 object. If endpoint_url is provided (custom S3-compatible),
+    use it; otherwise construct standard AWS S3 URL.
+    """
+    if endpoint_url:
+        # Normalize endpoint - should be like https://s3.custom.local
+        base = endpoint_url.rstrip("/")
+        return f"{base}/{bucket}/{key}"
+    # Standard AWS S3 URL format. Prefer virtual-hosted-style.
+    region = region_hint or "us-east-1"
+    if region == "us-east-1":
+        return f"https://{bucket}.s3.amazonaws.com/{key}"
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+
+
+def upload_to_s3(file_path: Path, bucket: str, key: str) -> str:
+    """
+    Upload file to S3 and return a public or presigned URL.
+    - Makes object public-read if possible; otherwise generate a 7-day presigned URL.
+    - Returns '' on any failure.
+    """
+    client = _get_boto3_s3_client()
+    if not client:
+        print("[WARN] boto3 not available or client not configured; skipping upload.", file=sys.stderr)
+        return ""
+
+    # Attempt upload with public-read ACL
+    try:
+        extra_args = {"ACL": "public-read"}
+        client.upload_file(str(file_path), bucket, key, ExtraArgs=extra_args)  # type: ignore
+    except ClientError as ce:
+        # If AccessDenied for ACL or public blocks, attempt upload without ACL
+        msg = str(ce)
+        print(f"[WARN] S3 upload with public-read ACL failed: {msg}", file=sys.stderr)
+        try:
+            client.upload_file(str(file_path), bucket, key)  # type: ignore
+        except Exception as e:
+            print(f"[WARN] S3 upload failed: {e}", file=sys.stderr)
+            return ""
+    except (BotoCoreError, Exception) as e:
+        print(f"[WARN] S3 upload failed: {e}", file=sys.stderr)
+        return ""
+
+    # Try to construct a public URL first
+    try:
+        endpoint_url = os.environ.get("AWS_S3_ENDPOINT_URL")
+        region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or _guess_region_from_bucket(bucket)
+        public_url = _build_http_url(bucket, key, region_hint=region, endpoint_url=endpoint_url)
+        # We cannot verify public-read here; return constructed URL optimistically.
+        return public_url
+    except Exception as e:
+        print(f"[WARN] Failed to build public URL: {e}", file=sys.stderr)
+
+    # Fallback: presigned URL valid for 7 days (604800 seconds)
+    try:
+        presigned = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=604800,  # 7 days
+        )  # type: ignore
+        return presigned
+    except Exception as e:
+        print(f"[WARN] Failed to generate presigned URL: {e}", file=sys.stderr)
+        return ""
+
+
+def _save_frame_temp_jpg(frame, quality: int = 90) -> Optional[Path]:
+    """Save an OpenCV frame (BGR) to a temporary JPEG and return its path."""
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="frame_", suffix=".jpg")
+        os.close(fd)
+        p = Path(temp_path)
+        # Encode as JPEG
+        import cv2 as _cv2  # local import to ensure CV2_AVAILABLE not required here
+        ok = _cv2.imwrite(str(p), frame, [_cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+        if not ok:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+            return None
+        return p
+    except Exception as e:
+        print(f"[WARN] Failed to save frame to temp JPG: {e}", file=sys.stderr)
+        return None
 
 
 def _process():
@@ -313,6 +457,9 @@ def _process():
                 )
                 xyxy_list = xyxy.tolist() if hasattr(xyxy, "tolist") else list(xyxy)
 
+                # Save the sampled frame once if we will record any detection, to upload to S3.
+                uploaded_url_cache: Optional[str] = None
+
                 for i, raw_c in enumerate(conf_list):
                     try:
                         conf = float(raw_c)
@@ -342,8 +489,33 @@ def _process():
                     else:
                         x1 = y1 = x2 = y2 = 0
 
-                    # Write the detection using the original label string (preserve case as produced by model)
-                    _append_detection(out_path, t, label, x1, y1, x2, y2, conf)
+                    # Ensure we have attempted S3 upload once per sampled frame time if a detection is recorded
+                    if uploaded_url_cache is None:
+                        # Save the frame to a temp JPEG
+                        tmp_img = _save_frame_temp_jpg(frame)
+                        s3_url = ""
+                        if tmp_img is not None:
+                            try:
+                                # Build S3 key based on video basename and timestamp in ms
+                                video_basename = Path(HARDCODED_VIDEO_URL).name or "video"
+                                timestamp_ms = int(round(t * 1000.0))
+                                object_key = f"frames/{video_basename}/{timestamp_ms}.jpg"
+                                s3_url = upload_to_s3(tmp_img, "humanlabelimg-poc", object_key)
+                            except Exception as e:
+                                print(f"[WARN] S3 upload attempt failed: {e}", file=sys.stderr)
+                                s3_url = ""
+                            finally:
+                                try:
+                                    tmp_img.unlink()
+                                except Exception:
+                                    pass
+                        else:
+                            print("[WARN] Skipping S3 upload due to temp image save failure.", file=sys.stderr)
+                            s3_url = ""
+                        uploaded_url_cache = s3_url  # cache result (even if empty) for subsequent detections in same frame
+
+                    # Write the detection including pose (blank) and s3_image_link
+                    _append_detection(out_path, t, label, x1, y1, x2, y2, conf, pose="", s3_url=uploaded_url_cache or "")
                     total_detections_written += 1
 
             except Exception as e:
