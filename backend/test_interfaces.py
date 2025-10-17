@@ -62,7 +62,7 @@ def upload_sample_file_to_s3() -> None:
 
     try:
         s3.upload_file(str(local_path), BUCKET_NAME, object_key)
-        print(f"Upload successful: {local_path.name} -> s3://{BUCKET_NAME}/{object_key}")
+        print("Upload Success")
     except (BotoCoreError, ClientError) as e:
         # Re-raise for visibility while printing a helpful message
         print(f"S3 upload failed: {e}")
@@ -101,7 +101,7 @@ def download_sample_file_from_s3() -> None:
 
     try:
         s3.download_file(BUCKET_NAME, DOWNLOAD_OBJECT_KEY, str(local_dest))
-        print(f"Download successful: s3://{BUCKET_NAME}/{DOWNLOAD_OBJECT_KEY} -> {local_dest.name}")
+        print("Download Success")
     except (BotoCoreError, ClientError) as e:
         print(f"S3 download failed: {e}")
         raise
