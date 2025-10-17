@@ -63,3 +63,13 @@ def upload_sample_file_to_s3() -> None:
         # Re-raise for visibility while printing a helpful message
         print(f"S3 upload failed: {e}")
         raise
+
+
+if __name__ == "__main__":
+    try:
+        upload_sample_file_to_s3()
+        print("Success")
+    except Exception as exc:
+        # Let existing function's behavior surface; also print a simple error note here.
+        print(f"Error: {exc}")
+        raise
