@@ -1,0 +1,65 @@
+"""
+A minimal helper for uploading a local file to S3.
+Requirements:
+- Hardcode bucket: "humanlabelimg-poc"
+- Hardcode local file: "samplefileupload.txt" (same directory as this script)
+- Use AWS credentials from environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+- No argument parser or other logic; only one function is needed
+"""
+
+import os
+import pathlib
+
+import boto3
+from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+
+BUCKET_NAME = "humanlabelimg-poc"
+LOCAL_FILE_NAME = "samplefileupload.txt"
+
+
+# PUBLIC_INTERFACE
+def upload_sample_file_to_s3() -> None:
+    """
+    Uploads the local file 'samplefileupload.txt' (expected in the same folder as this file)
+    to the S3 bucket 'humanlabelimg-poc'.
+
+    Credentials are read from environment variables:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+    Optionally, AWS_REGION (defaults to 'us-east-1' if not provided)
+
+    Raises exceptions on failure to allow callers to detect issues, but prints concise
+    status messages for quick visibility.
+    """
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    region = os.getenv("AWS_REGION", "us-east-1")
+
+    if not access_key or not secret_key:
+        # Raise the standard boto exception used when credentials are missing
+        raise NoCredentialsError()
+
+    script_dir = pathlib.Path(__file__).resolve().parent
+    local_path = script_dir / LOCAL_FILE_NAME
+
+    if not local_path.exists():
+        raise FileNotFoundError(f"Required file not found: {local_path}")
+
+    session = boto3.session.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+
+    s3 = session.client("s3")
+
+    # Use the same filename as the S3 object key
+    object_key = LOCAL_FILE_NAME
+
+    try:
+        s3.upload_file(str(local_path), BUCKET_NAME, object_key)
+        print(f"Upload successful: {local_path.name} -> s3://{BUCKET_NAME}/{object_key}")
+    except (BotoCoreError, ClientError) as e:
+        # Re-raise for visibility while printing a helpful message
+        print(f"S3 upload failed: {e}")
+        raise
