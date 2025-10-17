@@ -257,6 +257,32 @@ def setup_database_and_table() -> None:
                 print("[DB-SETUP] Creating table `detections` if not exists ...")
                 cursor.execute(create_table_sql)
                 print("[DB-SETUP] Table ensured.")
+
+                # Ensure created_at column exists for legacy tables created without it
+                print("[DB-SETUP] Verifying `created_at` column exists ...")
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = %s
+                      AND TABLE_NAME = 'detections'
+                      AND COLUMN_NAME = 'created_at'
+                    """,
+                    (db_name,),
+                )
+                exists = cursor.fetchone()
+                has_created_at = bool(exists and exists[0] == 1)
+                if not has_created_at:
+                    print("[DB-SETUP] `created_at` missing; altering table to add it ...")
+                    cursor.execute(
+                        """
+                        ALTER TABLE detections
+                        ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        """
+                    )
+                    print("[DB-SETUP] `created_at` column added.")
+                else:
+                    print("[DB-SETUP] `created_at` column already present.")
             finally:
                 if cursor is not None:
                     cursor.close()
