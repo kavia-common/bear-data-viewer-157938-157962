@@ -49,6 +49,18 @@ import tempfile
 import os
 from pathlib import Path
 from typing import List, Tuple, Optional
+from contextlib import contextmanager
+
+
+try:
+    from dotenv import load_dotenv
+    # Load .env file from the same directory as this script
+    env_path = Path(__file__).resolve().parent / '.env'
+    load_dotenv(dotenv_path=env_path)
+    print(f"[INFO] Loaded environment variables from: {env_path}")
+except ImportError:
+    print("[WARN] python-dotenv not installed. Install with: pip install python-dotenv")
+    print("[WARN] Falling back to system environment variables")
 
 # Try to import boto3 for S3 uploads; guard if missing
 try:
@@ -82,13 +94,145 @@ except Exception as e:
     print(f"[WARN] requests import failed (URL fallback disabled): {e}", file=sys.stderr)
     REQUESTS_AVAILABLE = False
 
+try:
+    import mysql.connector as mysql_connector
+    from mysql.connector import Error as MySQLError
+    MYSQL_AVAILABLE = True
+except Exception as e:
+    print(f"[WARN] mysql-connector-python import failed (DB disabled): {e}", file=sys.stderr)
+    mysql_connector = None
+    MySQLError = Exception
+    MYSQL_AVAILABLE = False
+
+def _get_db_env() -> Tuple[str, int, str, str, str]:
+    """Load DB connection settings from environment."""
+    host = os.environ.get("DB_HOST", "")
+    port_raw = os.environ.get("DB_PORT", "3306")
+    user = os.environ.get("DB_USER", "")
+    password = os.environ.get("DB_PASSWORD", "")
+    db_name = os.environ.get("DB_NAME", "")
+
+    try:
+        port = int(port_raw)
+    except ValueError:
+        print(f"[DB] Invalid DB_PORT value '{port_raw}', defaulting to 3306")
+        port = 3306
+
+    return host, port, user, password, db_name
+
+@contextmanager
+def _db_connection(database: Optional[str] = None):
+    """Context manager that yields a MySQL/MariaDB connection."""
+    if not MYSQL_AVAILABLE:
+        raise RuntimeError("mysql-connector-python is required but not installed.")
+
+    host, port, user, password, db_name_env = _get_db_env()
+    db_to_use = database if database is not None else None
+
+    conn = None
+    try:
+        conn = mysql_connector.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=db_to_use,
+            autocommit=True,
+        )
+        yield conn
+    except MySQLError as e:
+        print(f"[DB] Connection error: {e}")
+        raise
+    finally:
+        try:
+            if conn is not None and conn.is_connected():
+                conn.close()
+        except Exception:
+            pass
+
+def setup_database_and_table() -> None:
+    """Create the database and detections table if they don't exist."""
+    if not MYSQL_AVAILABLE:
+        print("[DB-SETUP] MySQL connector not available, skipping database setup.")
+        return
+
+    host, port, user, password, db_name = _get_db_env()
+    if not db_name:
+        print("[WARN] DB_NAME not set, skipping database setup.")
+        return
+
+    # Create database
+    try:
+        with _db_connection(database=None) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`")
+            cursor.close()
+    except Exception as e:
+        print(f"[DB-SETUP] Failed creating database: {e}")
+        return
+
+    # Create table
+    create_table_sql = """
+        CREATE TABLE IF NOT EXISTS detections (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            frame_time_seconds INT,
+            label VARCHAR(255),
+            x1 INT,
+            y1 INT,
+            x2 INT,
+            y2 INT,
+            obj_label_confidence FLOAT,
+            pose VARCHAR(255),
+            S3_img_link VARCHAR(1024),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+
+    try:
+        with _db_connection(database=db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_table_sql)
+            cursor.close()
+    except Exception as e:
+        print(f"[DB-SETUP] Failed creating table: {e}")
+
+def insert_detection_to_db(time_s: float, label: str, x1: int, y1: int, x2: int, y2: int, 
+                           conf: float, pose: str, s3_url: str) -> bool:
+    """Insert a single detection record into the database."""
+    if not MYSQL_AVAILABLE:
+        return False
+
+    host, port, user, password, db_name = _get_db_env()
+    if not db_name:
+        return False
+
+    insert_sql = """
+        INSERT INTO detections
+            (frame_time_seconds, label, x1, y1, x2, y2, obj_label_confidence, pose, S3_img_link)
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    try:
+        with _db_connection(database=db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(insert_sql, (
+                int(time_s), label, x1, y1, x2, y2, conf, pose, s3_url
+            ))
+            cursor.close()
+            return True
+    except Exception as e:
+        print(f"[DB] Failed to insert detection: {e}")
+        return False
+
+from contextlib import contextmanager
 
 SAMPLE_INTERVAL_SECONDS = 10.0
 MODEL_WEIGHTS = "yolov8m.pt"
 OUTPUT_FILENAME = "identified_bear.dat"
 
 # Acceptance criteria: Use hardcoded S3 URL
-HARDCODED_VIDEO_URL = "https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/1.mp4"
+HARDCODED_VIDEO_URL = "https://humanlabelimg-poc.s3.us-east-2.amazonaws.com/2.mp4"
 
 
 def _here() -> Path:
@@ -353,7 +497,7 @@ def upload_to_s3(file_path: Path, bucket: str, key: str) -> str:
     try:
         presigned = client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": bucket, "Key": key},
+            Params={"Bucket": "humanlabelimg-poc", "Key": key},
             ExpiresIn=604800,  # 7 days
         )  # type: ignore
         return presigned
@@ -361,13 +505,13 @@ def upload_to_s3(file_path: Path, bucket: str, key: str) -> str:
         print(f"[WARN] Failed to generate presigned URL: {e}", file=sys.stderr)
         return ""
 
-
 def _save_frame_temp_jpg(frame, quality: int = 90) -> Optional[Path]:
     """Save an OpenCV frame (BGR) to a temporary JPEG and return its path."""
     try:
         fd, temp_path = tempfile.mkstemp(prefix="frame_", suffix=".jpg")
         os.close(fd)
         p = Path(temp_path)
+        print("Temp Path",temp_path)
         # Encode as JPEG
         import cv2 as _cv2  # local import to ensure CV2_AVAILABLE not required here
         ok = _cv2.imwrite(str(p), frame, [_cv2.IMWRITE_JPEG_QUALITY, int(quality)])
@@ -387,6 +531,11 @@ def _process():
     """Main processing routine with summary printing and exit codes."""
     base_dir = _here()
     out_path = base_dir / OUTPUT_FILENAME
+
+    try:
+        setup_database_and_table()
+    except Exception as e:
+        print(f"[WARN] Database setup failed: {e}. Continuing without DB.", file=sys.stderr)
 
     # Load model
     model = _load_model()
@@ -496,10 +645,9 @@ def _process():
                         s3_url = ""
                         if tmp_img is not None:
                             try:
-                                # Build S3 key based on video basename and timestamp in ms
-                                video_basename = Path(HARDCODED_VIDEO_URL).name or "video"
+                                # Build S3 key based on timestamp in ms
                                 timestamp_ms = int(round(t * 1000.0))
-                                object_key = f"frames/{video_basename}/{timestamp_ms}.jpg"
+                                object_key = f"{timestamp_ms}.jpg"
                                 s3_url = upload_to_s3(tmp_img, "humanlabelimg-poc", object_key)
                             except Exception as e:
                                 print(f"[WARN] S3 upload attempt failed: {e}", file=sys.stderr)
@@ -515,7 +663,14 @@ def _process():
                         uploaded_url_cache = s3_url  # cache result (even if empty) for subsequent detections in same frame
 
                     # Write the detection including pose (blank) and s3_image_link
-                    _append_detection(out_path, t, label, x1, y1, x2, y2, conf, pose="", s3_url=uploaded_url_cache or "")
+                    # Write to CSV (existing)
+                    _append_detection(out_path, t, label, x1, y1, x2, y2, conf, 
+                                    pose="", s3_url=uploaded_url_cache or "")
+                    
+                    # ADD THIS: Write to database
+                    insert_detection_to_db(t, label, x1, y1, x2, y2, conf, 
+                                          pose="", s3_url=uploaded_url_cache or "")
+                    
                     total_detections_written += 1
 
             except Exception as e:
