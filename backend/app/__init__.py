@@ -10,7 +10,8 @@ app = Flask(__name__)
 app.url_map.strict_slashes = False
 
 # Restore original CORS behavior: allow any origin for /api/* to simplify local dev and container preview.
-# For production, tighten this to specific origins (e.g., ["http://localhost:3000"]).
+# For production, tighten this to specific origins (e.g., ["http://localhost:3000", "https://your-frontend.example.com"]).
+# If you need to restrict methods/headers, add supports_credentials=False and specify allow_headers.
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
