@@ -4,12 +4,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 
-from flask import Blueprint, current_app, jsonify
+from flask import current_app, jsonify
+from flask_smorest import Blueprint
 
-# Create blueprint for bears routes
-bears_bp = Blueprint("bears", __name__)
-# Alias expected by app/__init__.py
-blp = bears_bp
+# Create blueprint for bears routes using flask_smorest for Api.register_blueprint compatibility
+blp = Blueprint("bears", "bears", description="Bears endpoints")
 
 # Environment variable keys for DB
 DB_HOST = os.getenv("DB_HOST")
@@ -141,7 +140,7 @@ def _fetch_bears_from_db(conn) -> List[Dict[str, Any]]:
 
 
 # PUBLIC_INTERFACE
-@bears_bp.get("/api/bears")
+@blp.get("/api/bears")
 def get_bears():
     """
     Returns a list of Bear detection records from the database. Each record contains:
@@ -189,7 +188,7 @@ def get_bears():
 
 
 # PUBLIC_INTERFACE
-@bears_bp.get("/api/bears/detectmotion")
+@blp.get("/api/bears/detectmotion")
 def detect_motion_stub():
     """
     Stub endpoint to simulate bear motion detection.
