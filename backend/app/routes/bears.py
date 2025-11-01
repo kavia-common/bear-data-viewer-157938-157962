@@ -1,13 +1,15 @@
 import os
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 
 from flask import Blueprint, current_app, jsonify
 
 # Create blueprint for bears routes
 bears_bp = Blueprint("bears", __name__)
+# Alias expected by app/__init__.py
+blp = bears_bp
 
 # Environment variable keys for DB
 DB_HOST = os.getenv("DB_HOST")
@@ -156,10 +158,33 @@ def get_bears():
         Falls back to empty list if database is not available.
     """
     with db_connection() as conn:
+        data: List[Dict[str, Any]] = []
         if conn:
             data = _fetch_bears_from_db(conn)
-        else:
-            data = []  # Fallback when DB is unavailable/misconfigured
+
+        # If DB is unavailable or returned no rows, provide 3 mock records
+        if not data:
+            now = datetime.now(timezone.utc)
+            mock = [
+                {
+                    "bearId": "1",
+                    "pose": "standing",
+                    "timestamp": (now.replace(microsecond=0)).isoformat(),
+                },
+                {
+                    "bearId": "2",
+                    "pose": "walking",
+                    "timestamp": (now.replace(microsecond=0) - timedelta(seconds=10)).isoformat(),
+                },
+                {
+                    "bearId": "3",
+                    "pose": "sitting",
+                    "timestamp": (now.replace(microsecond=0) - timedelta(seconds=20)).isoformat(),
+                },
+            ]
+            # Ensure sorted by timestamp descending (most recent first)
+            data = sorted(mock, key=lambda x: x["timestamp"], reverse=True)
+
     return jsonify(data), 200
 
 
